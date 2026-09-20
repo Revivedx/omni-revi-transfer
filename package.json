@@ -1,6 +1,6 @@
 {
   "name": "omni-revi-transfer",
-  "version": "0.0.9",
+  "version": "0.0.9b",
   "description": "Browse, manage, and share your Steam Deck's native screenshots (gallery, storage limit, local QR sharing) from the Decky Quick Access Menu.",
   "type": "module",
   "scripts": {

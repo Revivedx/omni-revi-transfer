@@ -647,9 +647,17 @@ function GoogleDriveLinkModal({ onLinked, onClose }: { onLinked: () => void; onC
 
         {state === "waiting" && info && (
           <>
-            {qrDataUrl && <img src={qrDataUrl} alt="QR code" style={{ width: "180px", height: "180px" }} />}
-            <div style={{ fontSize: "0.75em", opacity: 0.7, margin: "4px 0" }}>
-              Scan with your phone, then approve access. Code: <strong>{info.user_code}</strong>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "24px" }}>
+              {qrDataUrl && <img src={qrDataUrl} alt="QR code" style={{ width: "180px", height: "180px" }} />}
+              <div>
+                <div style={{ fontSize: "0.8em", opacity: 0.7 }}>Code</div>
+                <div style={{ fontSize: "2.6em", fontWeight: 700, letterSpacing: "0.08em", fontFamily: "monospace" }}>
+                  {info.user_code}
+                </div>
+              </div>
+            </div>
+            <div style={{ fontSize: "0.75em", opacity: 0.7, margin: "8px 0 4px" }}>
+              Scan with your phone, then approve access.
             </div>
             <div style={{ fontSize: "0.7em", opacity: 0.6 }}>Waiting for approval...</div>
           </>

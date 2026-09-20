@@ -2,7 +2,13 @@
 
 **What the plugin does:** Omni-Revi-Transfer is a plugin for the Steam Deck (installed through [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader)) that lets you browse, manage and share the screenshots your Deck already takes, right from the in-game Quick Access Menu: send one to your phone with a QR code, to your Steam account or a Steam friend, to a Discord channel, or to your own Google Drive, without ever leaving your controller.
 
-## Latest update — v0.0.9
+## Latest update — v0.0.9b
+
+- **Non-Steam games show their name** (gallery, Google Drive folder, Discord message) instead of "Game (id)".
+- **Google Drive** recreates a game's folder if you delete it in Drive.
+- The Google Drive link code is now much larger and easier to read.
+
+Version 0.0.9 (previous update):
 
 - **Desktop Mode installer**: a `.desktop` file to install, configure your keys and uninstall the plugin with a small menu ([how](#download-and-install)).
 - **Share to Discord and Steam**: post to a Discord channel, upload to your Steam account, or open a Steam friend's chat with the screenshot ready to send, plus optional **auto-upload** with a delay you choose.

@@ -2,6 +2,15 @@
 
 All notable changes to Omni-Revi-Transfer are documented in this file. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.0.9b] - 2026-09-20
+
+### Fixed
+- Screenshots of non-Steam games showed as "Game (<id>)" in the gallery, in the Google Drive folder name and in the Discord message. The plugin now reads the game's name from Steam's `shortcuts.vdf`, matching the screenshot folder by the shortcut's id.
+- Google Drive: a game's folder was remembered by id only, so after deleting a folder in Drive (or after a game's name got resolved) uploads kept going to the old, trashed folder and no new folder appeared. Folders are now remembered per game name, and a folder that was deleted or trashed is detected and created again.
+
+### Changed
+- The Google Drive link screen shows the code in much larger type, next to the QR.
+
 ## [0.0.9] - 2026-09-18
 
 > Version 0.0.8 was an internal test version that was never published; everything it contained is included here.

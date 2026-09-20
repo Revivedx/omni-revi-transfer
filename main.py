@@ -34,6 +34,7 @@ import socket
 import threading
 import time
 import urllib.parse
+import zlib
 from typing import Optional
 
 import decky
@@ -116,6 +117,89 @@ def _steamapps_dirs() -> list[str]:
     return dirs
 
 
+# Non-Steam games ("Add a Non-Steam Game") have no appmanifest; their names live
+# in the account's shortcuts.vdf, a binary VDF file.
+
+def _parse_binary_vdf(data: bytes, pos: int = 0) -> tuple:
+    """Minimal parser for Valve's binary VDF. Returns (dict with lowercased
+    keys, position after the map). Raises ValueError on anything unexpected."""
+    result: dict = {}
+    while pos < len(data):
+        kind = data[pos]
+        pos += 1
+        if kind == 0x08:
+            return result, pos
+        end = data.index(b"\x00", pos)
+        key = data[pos:end].decode("utf-8", errors="replace").lower()
+        pos = end + 1
+        if kind == 0x00:
+            result[key], pos = _parse_binary_vdf(data, pos)
+        elif kind == 0x01:
+            end = data.index(b"\x00", pos)
+            result[key] = data[pos:end].decode("utf-8", errors="replace")
+            pos = end + 1
+        elif kind in (0x02, 0x03, 0x04, 0x06):
+            result[key] = int.from_bytes(data[pos:pos + 4], "little")
+            pos += 4
+        elif kind == 0x07:
+            result[key] = int.from_bytes(data[pos:pos + 8], "little")
+            pos += 8
+        else:
+            raise ValueError(f"unknown binary VDF type {kind}")
+    return result, pos
+
+
+def _shortcut_appid(entry: dict) -> int:
+    """The 32-bit app id of a shortcut. Steam stores it in the entry; entries
+    written by older tools lack it, and Steam derives it from the executable
+    and the name."""
+    appid = entry.get("appid")
+    if not isinstance(appid, int):
+        appid = zlib.crc32((str(entry.get("exe", "")) + str(entry.get("appname", ""))).encode("utf-8")) | 0x80000000
+    return appid & 0xFFFFFFFF
+
+
+# (shortcuts.vdf path, its mtime in ns, {folder id -> name}). Re-read only
+# when the file changes, so renaming a shortcut shows up without a restart.
+_shortcut_names_cache: tuple = (None, 0, {})
+
+
+def _shortcut_names() -> dict:
+    """Names of the user's non-Steam games, keyed by the id forms Steam uses.
+    Screenshot folders are named with the low 24 bits of the shortcut's 32-bit
+    app id (confirmed on a Deck: 3833968242 -> folder 8762994); the full
+    32-bit id and the 64-bit game id (app id << 32 | 0x02000000) are also
+    accepted."""
+    global _shortcut_names_cache
+    account_id = _detect_steam_account_id()
+    if account_id is None:
+        return {}
+    path = os.path.join(STEAM_USERDATA_ROOT, account_id, "config", "shortcuts.vdf")
+    try:
+        mtime = os.stat(path).st_mtime_ns
+    except OSError:
+        return {}
+    if _shortcut_names_cache[0] == path and _shortcut_names_cache[1] == mtime:
+        return _shortcut_names_cache[2]
+    names: dict = {}
+    try:
+        with open(path, "rb") as f:
+            root, _ = _parse_binary_vdf(f.read())
+        shortcuts = next(iter(root.values()), {})
+        for entry in shortcuts.values() if isinstance(shortcuts, dict) else []:
+            name = entry.get("appname") if isinstance(entry, dict) else None
+            if not name:
+                continue
+            appid = _shortcut_appid(entry)
+            names[str(appid & 0xFFFFFF)] = name
+            names[str(appid)] = name
+            names[str((appid << 32) | 0x02000000)] = name
+    except (OSError, ValueError) as e:
+        decky.logger.warning(f"Could not read non-Steam game names from {path}: {e}")
+    _shortcut_names_cache = (path, mtime, names)
+    return names
+
+
 # appid -> name. Names never change for an installed game, and reading them
 # means parsing libraryfolders.vdf plus an appmanifest, so successful lookups
 # are remembered (the "Game (<appid>)" fallback is not, in case the game is
@@ -140,6 +224,9 @@ def _resolve_app_name(appid: str) -> str:
         if match:
             _app_name_cache[appid] = match.group(1)
             return match.group(1)
+    shortcut_name = _shortcut_names().get(appid)
+    if shortcut_name:
+        return shortcut_name
     return f"Game ({appid})"
 
 
@@ -745,11 +832,24 @@ def _drive_file_exists(access_token: str, filename: str, folder_id: str) -> bool
     return bool(result.get("files"))
 
 
-async def _get_drive_game_folder_id(access_token: str, appid: str) -> Optional[str]:
+def _drive_folder_usable(access_token: str, folder_id: str) -> bool:
+    """False only when Drive says the folder is gone or in the trash (also
+    when a parent was trashed). Any other failure, such as being offline,
+    counts as usable so a network hiccup never makes a duplicate folder."""
+    url = f"https://www.googleapis.com/drive/v3/files/{urllib.parse.quote(folder_id, safe='')}?" + urllib.parse.urlencode({"fields": "trashed"})
+    result = _http_json_request(url, "GET", None, access_token)
+    error = result.get("error")
+    if isinstance(error, dict) and error.get("code") == 404:
+        return False
+    return not result.get("trashed")
+
+
+async def _get_drive_game_folder_id(access_token: str, appid: str, _retry: bool = True) -> Optional[str]:
     """Returns the id of "omni-revi-transfer/screenshots/<Game Name>" in the
     user's Drive, creating any of the three levels on first use and caching
-    their ids locally afterwards (one folder id per appid, plus the two
-    shared parent folder ids)."""
+    their ids locally afterwards (one folder id per game name, plus the two
+    shared parent folder ids). A cached folder the user has since deleted or
+    trashed is detected and recreated."""
     token_data = _load_google_token()
     if token_data is None:
         return None
@@ -772,18 +872,27 @@ async def _get_drive_game_folder_id(access_token: str, appid: str) -> Optional[s
         token_data["screenshots_folder_id"] = screenshots_id
         _save_google_token(token_data)
 
-    game_folder_ids = token_data.get("game_folder_ids", {})
-    cached_game_id = game_folder_ids.get(appid)
-    if cached_game_id:
-        return cached_game_id
-
+    # Keyed by name as well as appid: when a game's name gets resolved (or
+    # changes), the folder must follow the name instead of the stale one.
     game_name = _resolve_drive_folder_name(appid)
+    cache_key = f"{appid}|{game_name}"
+    game_folder_ids = token_data.get("game_folder_ids", {})
+    cached_game_id = game_folder_ids.get(cache_key)
+    if cached_game_id:
+        if await _run_blocking(_drive_folder_usable, access_token, cached_game_id):
+            return cached_game_id
+        if _retry:
+            for stale_key in ("root_folder_id", "screenshots_folder_id", "game_folder_ids"):
+                token_data.pop(stale_key, None)
+            _save_google_token(token_data)
+            return await _get_drive_game_folder_id(access_token, appid, _retry=False)
+
     game_id = await _run_blocking(_get_or_create_drive_folder, access_token, game_name, screenshots_id)
     if game_id is None:
         decky.logger.warning(f"Google Drive: could not create/find the folder for '{game_name}'.")
         return None
 
-    game_folder_ids[appid] = game_id
+    game_folder_ids[cache_key] = game_id
     token_data["game_folder_ids"] = game_folder_ids
     _save_google_token(token_data)
     return game_id
