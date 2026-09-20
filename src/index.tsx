@@ -24,13 +24,27 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FaArrowDown, FaArrowUp, FaCamera, FaSyncAlt } from "react-icons/fa";
 import qrcode from "qrcode-generator";
 
+// A screenshot, or (kind "recording") one of Steam's saved game recordings.
 interface ScreenshotItem {
   filename: string;
   path: string;
   appName: string;
   modified: number;
   thumbnail: string;
+  kind?: "recording";
+  durationSeconds?: number | null;
+  sizeBytes?: number;
 }
+
+// Why a recording could not be turned into a single .mp4 for sharing.
+type ExportError = "no_video" | "no_ffmpeg" | "no_space" | "export_failed";
+
+// Video export settings (Settings -> Video export); see main.py.
+type ExportQuality = "original" | "smaller" | "smallest";
+type ExportEncoder = "software" | "hardware";
+
+// What a service uploads on its own. Steam only takes screenshots.
+type AutoUploadMode = "off" | "screenshots" | "videos" | "all";
 
 interface ScreenshotPage {
   total: number;
@@ -42,14 +56,26 @@ interface ScreenshotPage {
 interface Settings {
   max_storage_mb: number;
   auto_delete: boolean;
+  max_recordings_mb: number;
+  auto_delete_recordings: boolean;
+  used_recordings_mb: number;
+  over_limit_recordings: boolean;
   qr_share_duration_seconds: number;
-  auto_upload_google_drive: boolean;
-  auto_upload_discord: boolean;
+  auto_upload_mode_google_drive: AutoUploadMode;
+  auto_upload_mode_discord: AutoUploadMode;
   auto_upload_delay_google_drive: number;
   auto_upload_delay_discord: number;
-  auto_upload_steam: boolean;
+  auto_upload_mode_steam: AutoUploadMode;
   auto_upload_delay_steam: number;
   steam_upload_privacy: number;
+  export_quality: ExportQuality;
+  export_max_height: number;
+  export_encoder: ExportEncoder;
+  export_crop_16_9: boolean;
+  export_discord_limit_mb: number;
+  export_game_folders: boolean;
+  ffmpeg_available: boolean;
+  hardware_encoder_available: boolean;
   used_mb: number;
   over_limit: boolean;
   account_detected: boolean;
@@ -65,7 +91,7 @@ interface SteamAutoUploadConfig {
 
 interface ShareResult {
   url: string | null;
-  error: "invalid_path" | "server_failed" | null;
+  error: "invalid_path" | "server_failed" | ExportError | null;
 }
 
 interface GoogleDriveStatus {
@@ -90,7 +116,7 @@ interface GoogleDriveLinkPoll {
 
 interface GoogleDriveUploadResult {
   ok: boolean;
-  error: "invalid_path" | "not_linked" | "upload_failed" | "duplicate" | null;
+  error: "invalid_path" | "not_linked" | "upload_failed" | "duplicate" | ExportError | null;
 }
 
 interface DiscordStatus {
@@ -116,10 +142,18 @@ interface DiscordLinkPoll {
 
 interface DiscordUploadResult {
   ok: boolean;
-  error: "invalid_path" | "not_linked" | "upload_failed" | "too_large" | "rate_limited" | null;
+  error: "invalid_path" | "not_linked" | "upload_failed" | "too_large" | "rate_limited" | ExportError | null;
 }
 
 const getScreenshots = callable<[offset: number, limit: number], ScreenshotPage>("get_screenshots");
+const getRecordings = callable<[offset: number, limit: number], ScreenshotPage>("get_recordings");
+const screenshotTaken = callable<[], void>("screenshot_taken");
+const saveRecordingMp4 = callable<[path: string], { ok: boolean; path: string | null; error: string | null }>(
+  "save_recording_mp4"
+);
+const deleteRecording = callable<[path: string], boolean>("delete_recording");
+const uploadRecordingToDrive = callable<[path: string], GoogleDriveUploadResult>("upload_recording_to_drive");
+const uploadRecordingToDiscord = callable<[path: string], DiscordUploadResult>("upload_recording_to_discord");
 const getScreenshotImage = callable<[path: string], string | null>("get_screenshot_image");
 const deleteScreenshot = callable<[path: string], boolean>("delete_screenshot");
 const getSettings = callable<[], Settings>("get_settings");
@@ -378,6 +412,44 @@ async function shareToSteamFriend(item: ScreenshotItem, friend: SteamFriend, onC
 
 const PAGE_SIZE = 5;
 
+const isRecording = (item: ScreenshotItem) => item.kind === "recording";
+
+function exportErrorText(error: string | null | undefined): string | undefined {
+  switch (error) {
+    case "no_ffmpeg":
+      return "ffmpeg wasn't found on this Deck, so the recording can't be prepared.";
+    case "no_space":
+      return "Not enough free space to prepare the recording.";
+    case "no_video":
+      return "Steam hasn't finished saving this recording yet.";
+    case "export_failed":
+      return "The recording couldn't be prepared. Check the plugin log.";
+    default:
+      return undefined;
+  }
+}
+
+function formatDuration(seconds?: number | null): string {
+  if (seconds == null) return "";
+  const total = Math.round(seconds);
+  const minutes = Math.floor(total / 60);
+  const rest = String(total % 60).padStart(2, "0");
+  return minutes >= 60 ? `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, "0")}:${rest}` : `${minutes}:${rest}`;
+}
+
+function formatSize(bytes?: number): string {
+  if (bytes == null) return "";
+  return bytes >= 1024 * 1024 * 1024
+    ? `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
+    : `${Math.max(1, Math.round(bytes / (1024 * 1024)))} MB`;
+}
+
+// One line of details for a recording ("0:27 · 24 MB"); empty for screenshots.
+function recordingDetails(item: ScreenshotItem): string {
+  if (!isRecording(item)) return "";
+  return [formatDuration(item.durationSeconds), formatSize(item.sizeBytes)].filter(Boolean).join(" · ");
+}
+
 // Feature flag: mirrors GOOGLE_DRIVE_ENABLED in main.py (true in releases).
 // Both flags must match; set both to false to ship a build without Drive.
 const GOOGLE_DRIVE_ENABLED = true;
@@ -466,6 +538,12 @@ const SHARE_METHOD_OPTIONS = [
   ...(DISCORD_ENABLED ? [{ data: "discord", label: "Discord" }] : []),
 ];
 
+// Steam can't take a video, so recordings only offer the other services.
+const RECORDING_SHARE_METHOD_OPTIONS = [
+  ...SHARE_METHOD_OPTIONS.filter((o) => ["qr", "googledrive", "discord"].includes(o.data)),
+  { data: "save", label: "Save MP4 to Videos" },
+];
+
 // ModalRoot is used instead of ConfirmModal: the latter always forces its
 // own visible OK/Cancel buttons with no documented way to hide them, AND --
 // the real bug -- it doesn't close itself when they're pressed; you have to
@@ -517,7 +595,10 @@ function ShareModalContent({
         if (result.url) {
           setShareUrl(result.url);
         } else {
-          toaster.toast({ title: "Couldn't start sharing", body: "Check the plugin log" });
+          toaster.toast({
+            title: "Couldn't start sharing",
+            body: exportErrorText(result.error) ?? "Check the plugin log",
+          });
         }
       });
     });
@@ -552,7 +633,7 @@ function ShareModalContent({
       >
         <div style={{ fontWeight: 600, marginBottom: "8px" }}>Share via QR</div>
 
-        {starting && <div>Starting...</div>}
+        {starting && <div>{isRecording(item) ? "Preparing the video..." : "Starting..."}</div>}
 
         {shareUrl && (
           <div style={{ textAlign: "center" }}>
@@ -566,8 +647,8 @@ function ShareModalContent({
               </div>
             ) : (
               <div style={{ fontSize: "0.7em", opacity: 0.6, marginBottom: "8px" }}>
-                Scan on a phone on the same Wi-Fi to download. Pressing B keeps sharing running
-                until it's downloaded or it times out.
+                Scan on a phone on the same Wi-Fi to download{isRecording(item) ? " (a video can take a while)" : ""}.
+                Pressing B keeps sharing running until it's downloaded or it times out.
               </div>
             )}
             <ButtonItem layout="below" onClick={onStop}>
@@ -1060,10 +1141,12 @@ function PreviewModalContent({
   onDeleted: () => void;
   onClose: () => void;
 }) {
+  const recording = isRecording(item);
   const [src, setSrc] = useState<string>(item.thumbnail);
   const [shareMethod, setShareMethod] = useState("qr");
 
   useEffect(() => {
+    if (recording) return; // a recording only has its thumbnail to show
     let cancelled = false;
     getScreenshotImage(item.path).then((fullImage) => {
       if (!cancelled && fullImage) setSrc(fullImage);
@@ -1071,16 +1154,17 @@ function PreviewModalContent({
     return () => {
       cancelled = true;
     };
-  }, [item.path]);
+  }, [item.path, recording]);
 
   const onDelete = async () => {
-    const ok = await deleteScreenshot(item.path);
+    const ok = await (recording ? deleteRecording : deleteScreenshot)(item.path);
+    const what = recording ? "recording" : "screenshot";
     if (ok) {
-      toaster.toast({ title: "Screenshot deleted", body: item.filename });
+      toaster.toast({ title: `${recording ? "Recording" : "Screenshot"} deleted`, body: item.filename });
       onDeleted();
       onClose();
     } else {
-      toaster.toast({ title: "Couldn't delete the screenshot", body: item.filename });
+      toaster.toast({ title: `Couldn't delete the ${what}`, body: item.filename });
     }
   };
 
@@ -1098,13 +1182,28 @@ function PreviewModalContent({
         return;
       }
       toaster.toast({ title: "Uploading to Google Drive...", body: item.filename });
-      const result = await uploadScreenshotToDrive(item.path);
+      const result = await (recording ? uploadRecordingToDrive : uploadScreenshotToDrive)(item.path);
       if (result.ok) {
         toaster.toast({ title: "Uploaded to Google Drive", body: item.filename });
       } else if (result.error === "duplicate") {
         toaster.toast({ title: "Already on Google Drive", body: `${item.filename} was uploaded before.` });
+      } else if (exportErrorText(result.error)) {
+        toaster.toast({ title: "Upload failed", body: exportErrorText(result.error) });
       } else {
         toaster.toast({ title: "Upload failed", body: "Check the plugin log for details." });
+      }
+      return;
+    }
+    if (option.data === "save") {
+      toaster.toast({ title: "Saving the MP4...", body: item.filename });
+      const result = await saveRecordingMp4(item.path);
+      if (result.ok) {
+        toaster.toast({ title: "Saved to Videos", body: result.path?.split("/Videos/")[1] ?? item.filename });
+      } else {
+        toaster.toast({
+          title: "Couldn't save the video",
+          body: exportErrorText(result.error) ?? "Check the plugin log for details.",
+        });
       }
       return;
     }
@@ -1124,13 +1223,20 @@ function PreviewModalContent({
         return;
       }
       toaster.toast({ title: "Sending to Discord...", body: item.filename });
-      const result = await uploadScreenshotToDiscord(item.path);
+      const result = await (recording ? uploadRecordingToDiscord : uploadScreenshotToDiscord)(item.path);
       if (result.ok) {
         toaster.toast({ title: "Sent to Discord", body: item.filename });
+      } else if (exportErrorText(result.error)) {
+        toaster.toast({ title: "Upload failed", body: exportErrorText(result.error) });
       } else if (result.error === "not_linked") {
         toaster.toast({ title: "Discord link is gone", body: "The webhook was removed on Discord. Link it again." });
       } else if (result.error === "too_large") {
-        toaster.toast({ title: "Too large for Discord", body: "That server's upload limit was exceeded." });
+        toaster.toast({
+          title: "Too large for Discord",
+          body: recording
+            ? "It doesn't fit even when shrunk. Raise the Discord size limit in Video export, or share another way."
+            : "That server's upload limit was exceeded.",
+        });
       } else if (result.error === "rate_limited") {
         toaster.toast({ title: "Discord is rate limiting", body: "Wait a few seconds and try again." });
       } else {
@@ -1145,15 +1251,24 @@ function PreviewModalContent({
       <div style={{ minHeight: PIP_CONTENT_HEIGHT, display: "flex", flexDirection: "column", justifyContent: "center" }}>
         <div style={{ fontWeight: 600 }}>{item.filename}</div>
         <div style={{ fontSize: "0.8em", opacity: 0.7, marginBottom: "8px" }}>{item.appName}</div>
-        <img
-          src={src}
-          alt={item.filename}
-          style={{ maxWidth: "90%", maxHeight: PIP_CONTENT_HEIGHT, borderRadius: 4, display: "block", margin: "0 auto" }}
-        />
+        {src ? (
+          <img
+            src={src}
+            alt={item.filename}
+            style={{ maxWidth: "90%", maxHeight: PIP_CONTENT_HEIGHT, borderRadius: 4, display: "block", margin: "0 auto" }}
+          />
+        ) : (
+          <div style={{ textAlign: "center", opacity: 0.6, padding: "16px" }}>No preview available</div>
+        )}
+        {recording && (
+          <div style={{ fontSize: "0.8em", opacity: 0.7, textAlign: "center", marginTop: "4px" }}>
+            {recordingDetails(item)}
+          </div>
+        )}
         <div style={{ marginTop: "8px" }}>
           <DropdownItem
             label="Share"
-            rgOptions={SHARE_METHOD_OPTIONS}
+            rgOptions={recording ? RECORDING_SHARE_METHOD_OPTIONS : SHARE_METHOD_OPTIONS}
             selectedOption={shareMethod}
             onChange={onShareMethodChange}
           />
@@ -1194,17 +1309,21 @@ function GalleryRow({ item, onOpen }: { item: ScreenshotItem; onOpen: () => void
       onMouseEnter={() => setHighlighted(true)}
       onMouseLeave={() => setHighlighted(false)}
     >
-      <img
-        src={item.thumbnail}
-        alt={item.filename}
-        style={{
-          width: "96px",
-          height: "60px",
-          objectFit: "cover",
-          borderRadius: "4px",
-          flexShrink: 0,
-        }}
-      />
+      {item.thumbnail ? (
+        <img
+          src={item.thumbnail}
+          alt={item.filename}
+          style={{
+            width: "96px",
+            height: "60px",
+            objectFit: "cover",
+            borderRadius: "4px",
+            flexShrink: 0,
+          }}
+        />
+      ) : (
+        <div style={{ width: "96px", height: "60px", borderRadius: "4px", flexShrink: 0, background: "rgba(255,255,255,0.08)" }} />
+      )}
       <div style={{ overflow: "hidden" }}>
         <div
           style={{
@@ -1216,13 +1335,19 @@ function GalleryRow({ item, onOpen }: { item: ScreenshotItem; onOpen: () => void
         >
           {item.filename}
         </div>
-        <div style={{ fontSize: "0.75em", opacity: 0.6 }}>{item.appName}</div>
+        <div style={{ fontSize: "0.75em", opacity: 0.6 }}>
+          {[item.appName, recordingDetails(item)].filter(Boolean).join(" · ")}
+        </div>
       </div>
     </Focusable>
   );
 }
 
-function Gallery() {
+// The "Screenshots" and "Recordings" sections are the same list, paged five
+// at a time, over two different sources.
+function MediaSection({ kind }: { kind: "screenshot" | "recording" }) {
+  const recording = kind === "recording";
+  const title = recording ? "Recordings" : "Screenshots";
   const [expanded, setExpanded] = useState(false);
   const [offset, setOffset] = useState(0);
   const [page, setPage] = useState<ScreenshotPage | undefined>();
@@ -1232,13 +1357,13 @@ function Gallery() {
   const loadPage = useCallback(async (requestedOffset: number) => {
     setLoading(true);
     try {
-      const result = await getScreenshots(Math.max(0, requestedOffset), PAGE_SIZE);
-      setPage(result);
+      const result = await (recording ? getRecordings : getScreenshots)(Math.max(0, requestedOffset), PAGE_SIZE);
+      setPage(recording ? { ...result, items: result.items.map((i) => ({ ...i, kind: "recording" as const })) } : result);
       setOffset(result.offset);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [recording]);
 
   useEffect(() => {
     loadPage(0);
@@ -1247,11 +1372,11 @@ function Gallery() {
   // If auto-delete ran (limit exceeded), the current page is no longer
   // valid — go back to the start to reflect the real state.
   useEffect(() => {
-    const listener = addEventListener<[count: number]>("auto_delete_performed", () => {
-      loadPage(0);
+    const listener = addEventListener<[count: number, kind?: string]>("auto_delete_performed", (_count, kind) => {
+      if ((kind === "recordings") === recording) loadPage(0);
     });
     return () => removeEventListener("auto_delete_performed", listener);
-  }, [loadPage]);
+  }, [loadPage, recording]);
 
   const total = page?.total ?? 0;
   const hasPrev = offset > 0;
@@ -1259,10 +1384,10 @@ function Gallery() {
   const refreshCurrentPage = () => loadPage(offset);
 
   return (
-    <PanelSection title="Gallery">
+    <PanelSection title={title}>
       <PanelSectionRow>
         <ButtonItem layout="below" onClick={() => setExpanded((e) => !e)}>
-          {total ? `Gallery (${total})` : "Gallery"} {expanded ? "▲" : "▼"}
+          {total ? `${title} (${total})` : title} {expanded ? "▲" : "▼"}
         </ButtonItem>
       </PanelSectionRow>
 
@@ -1277,8 +1402,9 @@ function Gallery() {
           {!loading && page?.items.length === 0 && (
             <PanelSectionRow>
               <div>
-                No Steam screenshots yet. Take one with the Steam button + R1
-                (or RB) and refresh here.
+                {recording
+                  ? "No game recordings yet. Save a clip with Steam's game recording, then refresh here."
+                  : "No Steam screenshots yet. Take one with the Steam button + R1 (or RB) and refresh here."}
               </div>
             </PanelSectionRow>
           )}
@@ -1350,6 +1476,94 @@ function useSettingsUpdater(settings: Settings | undefined, setLocalSettings: (s
   );
 }
 
+// One kind of file (screenshots or recordings) with its own size limit,
+// warning tiers and optional auto-delete.
+function StorageBlock({
+  noun,
+  usedMb,
+  limitMb,
+  autoDelete,
+  onLimitChange,
+  onAutoDeleteChange,
+  deleteHint,
+}: {
+  noun: "screenshots" | "recordings";
+  usedMb: number;
+  limitMb: number;
+  autoDelete: boolean;
+  onLimitChange: (mb: number, autoDelete?: false) => void;
+  onAutoDeleteChange: (value: boolean) => void;
+  deleteHint: string;
+}) {
+  const isUnlimited = limitMb === STORAGE_LIMIT_UNLIMITED;
+  const usedPct = !isUnlimited && limitMb > 0 ? (usedMb / limitMb) * 100 : 0;
+  const tierColor = usedPct >= 100 ? "#f44336" : usedPct >= 90 ? "#ff7043" : usedPct >= 80 ? "#f5a623" : undefined;
+  const tierMessage =
+    usedPct >= 100
+      ? `Limit exceeded. ${deleteHint} or raise the limit above.`
+      : usedPct >= 90
+      ? `Storage is critically full (90%+ used). Consider deleting some ${noun} soon.`
+      : usedPct >= 80
+      ? "Storage warning: 80% or more of your limit is used."
+      : undefined;
+
+  const onSliderChange = (index: number) => {
+    const gb = STORAGE_LIMIT_VALUES_GB[index];
+    const mb = gb === STORAGE_LIMIT_UNLIMITED ? 0 : Math.round(gb * 1024);
+    if (mb === 0) onLimitChange(0, false);
+    else onLimitChange(mb);
+  };
+
+  return (
+    <>
+      <PanelSectionRow>
+        <div style={{ fontSize: "1.1em", fontWeight: 700, marginBottom: "4px" }}>
+          {noun === "recordings" ? "Recordings" : "Screenshots"}: {usedMb} MB used
+        </div>
+        <div style={{ fontSize: "1.0em", fontWeight: 600, marginBottom: "4px" }}>
+          {storageLimitDescription(limitMb / 1024)}
+        </div>
+        {isUnlimited && (
+          <div style={{ fontSize: "0.65em", opacity: 0.6, marginBottom: "6px" }}>
+            Not recommended on Decks with a small SSD.
+          </div>
+        )}
+        <SliderField
+          label="Warning Limit"
+          description={`Gives a warning when your ${noun} pass this size.`}
+          value={storageLimitIndexForMb(limitMb)}
+          min={0}
+          max={STORAGE_LIMIT_LAST_INDEX}
+          step={1}
+          onChange={onSliderChange}
+        />
+      </PanelSectionRow>
+
+      {tierColor && tierMessage && (
+        <PanelSectionRow>
+          <div style={{ color: tierColor, fontWeight: usedPct >= 90 ? 600 : undefined }}>{tierMessage}</div>
+        </PanelSectionRow>
+      )}
+
+      <PanelSectionRow>
+        <ToggleField
+          label={`Auto-delete oldest ${noun} when over limit`}
+          description={
+            isUnlimited
+              ? "Not applicable with no limit set."
+              : `⚠ WARNING: if enabled, once you pass the Warning Limit above, this plugin will PERMANENTLY DELETE your oldest ${noun} — from ANY game — without asking, until you're back under the limit.${
+                  noun === "recordings" ? " The newest recording is never deleted." : ""
+                } This cannot be undone. Leave this off unless you're sure.`
+          }
+          checked={autoDelete}
+          disabled={isUnlimited}
+          onChange={onAutoDeleteChange}
+        />
+      </PanelSectionRow>
+    </>
+  );
+}
+
 function StoragePanel() {
   const [expanded, setExpanded] = useState(false);
   const [settings, setLocalSettings] = useState<Settings | undefined>();
@@ -1362,58 +1576,24 @@ function StoragePanel() {
     refresh();
   }, [refresh]);
 
+  // The toasts for these two events are shown by the plugin itself (see
+  // definePlugin), since they happen while the menu is closed; the panel only
+  // refreshes its numbers.
   useEffect(() => {
-    const listener = addEventListener<[count: number]>("auto_delete_performed", (count) => {
-      toaster.toast({
-        title: "Auto-delete ran",
-        body: `${count} old screenshot(s) removed to stay under your limit.`,
-      });
-      refresh();
-    });
-    return () => removeEventListener("auto_delete_performed", listener);
-  }, [refresh]);
-
-  // Fired by the backend (checked whenever the gallery loads/refreshes,
-  // the closest proxy we have to "right after a new screenshot was taken",
-  // since Steam -- not us -- does the actual capturing) the first time
-  // usage crosses 80/90/100%. `critical: true` is the only "make this red
-  // and urgent" knob the toast API exposes; there's no free-form color.
-  useEffect(() => {
-    const listener = addEventListener<[threshold: number]>("storage_threshold_reached", (threshold) => {
-      if (threshold >= 100) {
-        toaster.toast({ title: "Storage limit reached", body: "You're at or over your configured limit.", critical: true });
-      } else if (threshold >= 90) {
-        toaster.toast({ title: "Storage critical (90%)", body: "You're almost at your limit.", critical: true });
-      } else {
-        toaster.toast({ title: "Storage warning (80%)", body: "Your screenshots are taking up a lot of space." });
-      }
-      refresh();
-    });
-    return () => removeEventListener("storage_threshold_reached", listener);
+    const autoDeleted = addEventListener<[count: number, kind?: string]>("auto_delete_performed", () => refresh());
+    const alerted = addEventListener<[threshold: number, kind?: string]>("storage_threshold_reached", () => refresh());
+    return () => {
+      removeEventListener("auto_delete_performed", autoDeleted);
+      removeEventListener("storage_threshold_reached", alerted);
+    };
   }, [refresh]);
 
   const update = useSettingsUpdater(settings, setLocalSettings);
 
-  const isUnlimited = settings?.max_storage_mb === STORAGE_LIMIT_UNLIMITED;
-  const usedPct = settings && !isUnlimited && settings.max_storage_mb > 0 ? (settings.used_mb / settings.max_storage_mb) * 100 : 0;
-  const tierColor = usedPct >= 100 ? "#f44336" : usedPct >= 90 ? "#ff7043" : usedPct >= 80 ? "#f5a623" : undefined;
-  const tierMessage =
-    usedPct >= 100
-      ? 'Limit exceeded. Delete screenshots from the gallery (tap one and choose "Delete") or raise the limit above.'
-      : usedPct >= 90
-      ? "Storage is critically full (90%+ used). Consider deleting some screenshots soon."
-      : usedPct >= 80
-      ? "Storage warning: 80% or more of your limit is used."
-      : undefined;
+  const limitShort = (mb: number) => storageLimitShort(mb / 1024);
   const summary = settings
-    ? `Storage: ${settings.used_mb} MB / ${storageLimitShort(settings.max_storage_mb / 1024)}`
+    ? `Screenshots ${settings.used_mb} MB / ${limitShort(settings.max_storage_mb)} · Recordings ${settings.used_recordings_mb} MB / ${limitShort(settings.max_recordings_mb)}`
     : "Storage: loading...";
-
-  const onLimitChange = (index: number) => {
-    const gb = STORAGE_LIMIT_VALUES_GB[index];
-    const mb = gb === STORAGE_LIMIT_UNLIMITED ? 0 : Math.round(gb * 1024);
-    update(mb === 0 ? { max_storage_mb: 0, auto_delete: false } : { max_storage_mb: mb });
-  };
 
   return (
     <PanelSection title="Storage">
@@ -1428,49 +1608,36 @@ function StoragePanel() {
           {!settings.account_detected && (
             <PanelSectionRow>
               <div style={{ color: "#f5a623" }}>
-                Couldn't detect your Steam account in userdata/. The gallery might show up empty.
+                Couldn't detect your Steam account in userdata/. The lists might show up empty.
               </div>
             </PanelSectionRow>
           )}
 
+          <StorageBlock
+            noun="screenshots"
+            usedMb={settings.used_mb}
+            limitMb={settings.max_storage_mb}
+            autoDelete={settings.auto_delete}
+            deleteHint='Delete screenshots from the list (tap one and choose "Delete")'
+            onLimitChange={(mb, autoDelete) => update(autoDelete === false ? { max_storage_mb: mb, auto_delete: false } : { max_storage_mb: mb })}
+            onAutoDeleteChange={(checked) => update({ auto_delete: checked })}
+          />
+          <StorageBlock
+            noun="recordings"
+            usedMb={settings.used_recordings_mb}
+            limitMb={settings.max_recordings_mb}
+            autoDelete={settings.auto_delete_recordings}
+            deleteHint='Delete recordings from the list (tap one and choose "Delete")'
+            onLimitChange={(mb, autoDelete) =>
+              update(autoDelete === false ? { max_recordings_mb: mb, auto_delete_recordings: false } : { max_recordings_mb: mb })
+            }
+            onAutoDeleteChange={(checked) => update({ auto_delete_recordings: checked })}
+          />
           <PanelSectionRow>
-            <div style={{ fontSize: "1.1em", fontWeight: 700, marginBottom: "4px" }}>
-              {storageLimitDescription(settings.max_storage_mb / 1024)}
+            <div style={{ fontSize: "0.7em", opacity: 0.6 }}>
+              Recordings count Steam's saved clips. The MP4 files made to share one are temporary and not counted, and
+              neither are videos you saved to the Videos folder.
             </div>
-            {isUnlimited && (
-              <div style={{ fontSize: "0.65em", opacity: 0.6, marginBottom: "6px" }}>
-                Not recommended on Decks with a small SSD.
-              </div>
-            )}
-            <SliderField
-              label="Warning Limit"
-              description="Gives a warning when your screenshots pass this size."
-              value={storageLimitIndexForMb(settings.max_storage_mb)}
-              min={0}
-              max={STORAGE_LIMIT_LAST_INDEX}
-              step={1}
-              onChange={onLimitChange}
-            />
-          </PanelSectionRow>
-
-          {tierColor && tierMessage && (
-            <PanelSectionRow>
-              <div style={{ color: tierColor, fontWeight: usedPct >= 90 ? 600 : undefined }}>{tierMessage}</div>
-            </PanelSectionRow>
-          )}
-
-          <PanelSectionRow>
-            <ToggleField
-              label="Auto-delete oldest when over limit"
-              description={
-                isUnlimited
-                  ? "Not applicable with no limit set."
-                  : "⚠ WARNING: if enabled, once you pass the Warning Limit above, this plugin will PERMANENTLY DELETE your oldest screenshots — from ANY game — without asking, until you're back under the limit. This cannot be undone. Leave this off unless you're sure."
-              }
-              checked={settings.auto_delete}
-              disabled={isUnlimited}
-              onChange={(checked) => update({ auto_delete: checked })}
-            />
           </PanelSectionRow>
         </>
       )}
@@ -1482,35 +1649,59 @@ function StoragePanel() {
 const AUTO_UPLOAD_DELAY_MIN = 5;
 const AUTO_UPLOAD_DELAY_MAX = 60;
 
-// The auto-upload toggle plus, once it's on, the slider for how long to wait
-// after a screenshot before uploading. The chosen value is shown in the
-// label itself (like the storage limit) rather than relying on the
-// slider's own value display.
+const AUTO_UPLOAD_MODE_OPTIONS = [
+  { data: "off", label: "Off" },
+  { data: "screenshots", label: "Screenshots only" },
+  { data: "videos", label: "Recordings only" },
+  { data: "all", label: "Screenshots and recordings" },
+];
+// Steam can't take a video.
+const STEAM_AUTO_UPLOAD_MODE_OPTIONS = AUTO_UPLOAD_MODE_OPTIONS.slice(0, 2);
+
+// The auto-upload choice (off, screenshots, recordings or both) plus, once
+// it's not off, the slider for how long to wait after a file is saved before
+// uploading it. The chosen delay is shown in the label itself (like the
+// storage limit) rather than relying on the slider's own value display.
 function AutoUploadOptions({
   label,
   description,
-  enabled,
+  mode,
+  options = AUTO_UPLOAD_MODE_OPTIONS,
   delaySeconds,
-  onEnabledChange,
+  warning,
+  onModeChange,
   onDelayChange,
 }: {
   label: string;
   description: string;
-  enabled: boolean;
+  mode: AutoUploadMode;
+  options?: { data: string; label: string }[];
   delaySeconds: number;
-  onEnabledChange: (value: boolean) => void;
+  warning?: string;
+  onModeChange: (value: AutoUploadMode) => void;
   onDelayChange: (seconds: number) => void;
 }) {
   return (
     <>
       <PanelSectionRow>
-        <ToggleField label={label} description={description} checked={enabled} onChange={onEnabledChange} />
+        <DropdownItem
+          label={label}
+          description={description}
+          rgOptions={options}
+          selectedOption={mode}
+          onChange={(option) => onModeChange(option.data as AutoUploadMode)}
+        />
       </PanelSectionRow>
-      {enabled && (
+      {warning && (
+        <PanelSectionRow>
+          <div style={{ color: "#f5a623", fontSize: "0.75em" }}>{warning}</div>
+        </PanelSectionRow>
+      )}
+      {mode !== "off" && (
         <PanelSectionRow>
           <SliderField
             label={`Upload delay: ${delaySeconds} s`}
-            description="How long to wait after a screenshot before it's uploaded. Delete it or switch this off in that time to cancel."
+            description="How long to wait after a screenshot or recording is saved before it's uploaded. Delete it or switch this off in that time to cancel."
             value={delaySeconds}
             min={AUTO_UPLOAD_DELAY_MIN}
             max={AUTO_UPLOAD_DELAY_MAX}
@@ -1520,6 +1711,149 @@ function AutoUploadOptions({
         </PanelSectionRow>
       )}
     </>
+  );
+}
+
+// Rough cost of re-encoding, measured on a Deck with a 27 s 720p clip. Only a
+// guide: it grows with the clip's length and shrinks with the resolution.
+const REENCODE_COST =
+  "about 1.5-2 CPU cores and up to ~170 MB of RAM (~120 MB at 480p) while it runs, and roughly 0.4 s per second of video (0.2 s at 480p): a 1-minute clip takes about 25 s";
+
+function reencodeWarningForAuto(settings: Settings, service: "google_drive" | "discord"): string | undefined {
+  const mode = service === "discord" ? settings.auto_upload_mode_discord : settings.auto_upload_mode_google_drive;
+  if (mode !== "videos" && mode !== "all") return undefined;
+  if (settings.export_quality !== "original") {
+    return `⚠ Each new recording is re-encoded (${settings.export_quality === "smaller" ? "Smaller" : "Smallest"}) before it's uploaded, by itself and even while you play: ${REENCODE_COST}. Set Video export → Quality to Original to avoid it.`;
+  }
+  if (service === "discord" && settings.export_discord_limit_mb > 0) {
+    return `⚠ A recording bigger than the Discord size limit (${settings.export_discord_limit_mb} MB) is re-encoded to fit, by itself and even while you play: ${REENCODE_COST}.`;
+  }
+  return undefined;
+}
+
+const EXPORT_QUALITY_OPTIONS = [
+  { data: "original", label: "Original (no re-encode)" },
+  { data: "smaller", label: "Smaller" },
+  { data: "smallest", label: "Smallest" },
+];
+const EXPORT_HEIGHT_OPTIONS = [
+  { data: 0, label: "As recorded" },
+  { data: 720, label: "720p" },
+  { data: 480, label: "480p" },
+];
+const EXPORT_ENCODER_OPTIONS = [
+  { data: "software", label: "Software (x264)" },
+  { data: "hardware", label: "Hardware (VAAPI)" },
+];
+const EXPORT_DISCORD_LIMIT_OPTIONS = [
+  { data: 10, label: "10 MB" },
+  { data: 25, label: "25 MB" },
+  { data: 50, label: "50 MB" },
+  { data: 100, label: "100 MB" },
+  { data: 0, label: "Don't shrink" },
+];
+
+// How a recording becomes an MP4 when it is shared or saved. Steam stores it
+// as separate video and audio pieces; "Original" just joins them (instant,
+// big file), the other choices re-encode it to a smaller file.
+function VideoExportPanel() {
+  const [expanded, setExpanded] = useState(false);
+  const [settings, setLocalSettings] = useState<Settings | undefined>();
+
+  useEffect(() => {
+    getSettings().then(setLocalSettings);
+  }, []);
+
+  const update = useSettingsUpdater(settings, setLocalSettings);
+  const reencodes = settings?.export_quality !== "original";
+
+  return (
+    <PanelSection title="Video export">
+      <PanelSectionRow>
+        <ButtonItem layout="below" disabled={!settings} onClick={() => setExpanded((e) => !e)}>
+          Video export {expanded ? "▲" : "▼"}
+        </ButtonItem>
+      </PanelSectionRow>
+
+      {expanded && settings && (
+        <>
+          {!settings.ffmpeg_available && (
+            <PanelSectionRow>
+              <div style={{ color: "#f5a623" }}>
+                ffmpeg wasn't found on this Deck, so recordings can't be shared or saved as MP4.
+              </div>
+            </PanelSectionRow>
+          )}
+          <PanelSectionRow>
+            <DropdownItem
+              label="Quality"
+              description="Original joins the recording as it is: instant, but the file is big. Smaller and Smallest re-encode it to a much smaller file and take longer."
+              rgOptions={EXPORT_QUALITY_OPTIONS}
+              selectedOption={settings.export_quality}
+              onChange={(option) => update({ export_quality: option.data })}
+            />
+          </PanelSectionRow>
+          {reencodes && (
+            <PanelSectionRow>
+              <div style={{ color: "#f5a623", fontSize: "0.75em" }}>
+                ⚠ Smaller and Smallest re-encode the video, which uses {REENCODE_COST}. It runs at low priority, but it can
+                slow a game down if you share or auto-upload while playing. Hardware is quicker (about 0.25 s per second) but
+                uses about the same CPU and RAM. Original costs almost nothing.
+              </div>
+            </PanelSectionRow>
+          )}
+          {reencodes && (
+            <PanelSectionRow>
+              <DropdownItem
+                label="Maximum resolution"
+                description="Shrinks the picture when re-encoding. Lower is smaller."
+                rgOptions={EXPORT_HEIGHT_OPTIONS}
+                selectedOption={settings.export_max_height}
+                onChange={(option) => update({ export_max_height: option.data })}
+              />
+            </PanelSectionRow>
+          )}
+          <PanelSectionRow>
+            <DropdownItem
+              label="Encoder"
+              description={
+                settings.hardware_encoder_available
+                  ? "Used whenever a video is re-encoded. Hardware (the Deck's GPU) is faster but experimental; it falls back to software if it fails. Software runs at low priority."
+                  : "Used whenever a video is re-encoded. This Deck has no hardware encoder available. Software runs at low priority."
+              }
+              rgOptions={settings.hardware_encoder_available ? EXPORT_ENCODER_OPTIONS : EXPORT_ENCODER_OPTIONS.slice(0, 1)}
+              selectedOption={settings.hardware_encoder_available ? settings.export_encoder : "software"}
+              onChange={(option) => update({ export_encoder: option.data })}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ToggleField
+              label="Crop to 16:9"
+              description="Recordings made at the Deck's 16:10 shape are cropped to 16:9, as most players and sites expect. It forces a re-encode. Recordings that are already 16:9 are left alone."
+              checked={settings.export_crop_16_9}
+              onChange={(value) => update({ export_crop_16_9: value })}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <DropdownItem
+              label="Discord size limit"
+              description="Videos sent to Discord, by hand or by auto-upload, are shrunk to fit this size. Regular servers accept 10 MB; boosted ones 50 or 100 MB. A very long clip can't fit and is refused."
+              rgOptions={EXPORT_DISCORD_LIMIT_OPTIONS}
+              selectedOption={settings.export_discord_limit_mb}
+              onChange={(option) => update({ export_discord_limit_mb: option.data })}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ToggleField
+              label="A folder per game"
+              description={'"Save MP4 to Videos" puts each game\'s videos in Videos/<game name>/ instead of Videos/.'}
+              checked={settings.export_game_folders}
+              onChange={(value) => update({ export_game_folders: value })}
+            />
+          </PanelSectionRow>
+        </>
+      )}
+    </PanelSection>
   );
 }
 
@@ -1651,13 +1985,14 @@ function ShareOptionsPanel() {
               </PanelSectionRow>
               <AutoUploadOptions
                 label="Auto-upload to Steam"
-                description="Uploads each new screenshot to your Steam account without asking, with the privacy above. It counts against your Steam Cloud space."
-                enabled={settings.auto_upload_steam}
+                description="Uploads each new screenshot to your Steam account without asking, with the privacy above. It counts against your Steam Cloud space. Steam can't take recordings."
+                mode={settings.auto_upload_mode_steam}
+                options={STEAM_AUTO_UPLOAD_MODE_OPTIONS}
                 delaySeconds={settings.auto_upload_delay_steam}
-                onEnabledChange={(value) => update({ auto_upload_steam: value })}
+                onModeChange={(value) => update({ auto_upload_mode_steam: value })}
                 onDelayChange={(seconds) => update({ auto_upload_delay_steam: seconds })}
               />
-              {settings.auto_upload_steam && settings.steam_upload_privacy === 8 && (
+              {settings.auto_upload_mode_steam !== "off" && settings.steam_upload_privacy === 8 && (
                 <PanelSectionRow>
                   <div style={{ color: "#f5a623", fontSize: "0.75em" }}>
                     Privacy is Public: every auto-uploaded screenshot will be visible to everyone on your profile.
@@ -1721,10 +2056,11 @@ function ShareOptionsPanel() {
           {driveOpen && driveLinked && settings && (
             <AutoUploadOptions
               label="Auto-upload to Google Drive"
-              description="Uploads each new screenshot without asking. Anything in your screenshots gets uploaded, so leave this off if that's a concern."
-              enabled={settings.auto_upload_google_drive}
+              description="Uploads each new screenshot or recording without asking. Everything you capture gets uploaded, so leave this off if that's a concern. Recordings can be large."
+              mode={settings.auto_upload_mode_google_drive}
+              warning={reencodeWarningForAuto(settings, "google_drive")}
               delaySeconds={settings.auto_upload_delay_google_drive}
-              onEnabledChange={(value) => update({ auto_upload_google_drive: value })}
+              onModeChange={(value) => update({ auto_upload_mode_google_drive: value })}
               onDelayChange={(seconds) => update({ auto_upload_delay_google_drive: seconds })}
             />
           )}
@@ -1783,10 +2119,11 @@ function ShareOptionsPanel() {
           {discordOpen && discordLinked && settings && (
             <AutoUploadOptions
               label="Auto-upload to Discord"
-              description="Posts each new screenshot to your linked channel without asking. Anyone in that channel will see it."
-              enabled={settings.auto_upload_discord}
+              description="Posts each new screenshot or recording to your linked channel without asking. Anyone in that channel will see it. Discord servers limit upload size, so long recordings may be refused."
+              mode={settings.auto_upload_mode_discord}
+              warning={reencodeWarningForAuto(settings, "discord")}
               delaySeconds={settings.auto_upload_delay_discord}
-              onEnabledChange={(value) => update({ auto_upload_discord: value })}
+              onModeChange={(value) => update({ auto_upload_mode_discord: value })}
               onDelayChange={(seconds) => update({ auto_upload_delay_discord: seconds })}
             />
           )}
@@ -1796,11 +2133,39 @@ function ShareOptionsPanel() {
   );
 }
 
+// Fired by the backend the first time usage crosses 80/90/100% of a limit, and
+// again for each new file while it stays over the limit (Steam keeps saving
+// whatever the limit says). `critical: true` is the only "make this red and
+// urgent" knob the toast API exposes; there's no free-form color.
+function showStorageAlert(threshold: number, kind?: string) {
+  const noun = kind === "recordings" ? "recordings" : "screenshots";
+  if (threshold >= 100) {
+    toaster.toast({
+      title: `${noun === "recordings" ? "Recordings" : "Screenshots"} limit reached`,
+      body: `Steam keeps saving, so delete some ${noun} or turn on auto-delete.`,
+      critical: true,
+    });
+  } else if (threshold >= 90) {
+    toaster.toast({ title: "Storage critical (90%)", body: `Your ${noun} are almost at their limit.`, critical: true });
+  } else {
+    toaster.toast({ title: "Storage warning (80%)", body: `Your ${noun} are taking up a lot of space.` });
+  }
+}
+
+function showAutoDeleted(count: number, kind?: string) {
+  toaster.toast({
+    title: "Auto-delete ran",
+    body: `${count} old ${kind === "recordings" ? "recording(s)" : "screenshot(s)"} removed to stay under your limit.`,
+  });
+}
+
 function Content() {
   return (
     <>
-      <Gallery />
+      <MediaSection kind="screenshot" />
+      <MediaSection kind="recording" />
       <StoragePanel />
+      <VideoExportPanel />
       <ShareOptionsPanel />
     </>
   );
@@ -1841,6 +2206,7 @@ export default definePlugin(() => {
   const steamScreenshotRegistration =
     STEAM_SHARE_AVAILABLE && typeof SteamClient.GameSessions?.RegisterForScreenshotNotification === "function"
       ? SteamClient.GameSessions.RegisterForScreenshotNotification((notification) => {
+          screenshotTaken(); // storage limit: enforce it and repeat the over-the-limit alert
           autoUploadNewSteamScreenshot(notification.details.nAppID, notification.details.hHandle);
         })
       : undefined;
@@ -1857,12 +2223,19 @@ export default definePlugin(() => {
         const reason =
           error === "not_linked" ? "The link is no longer valid. Link it again from Share options."
           : error === "too_large" ? "The file is over the upload limit."
+          : exportErrorText(error) ? exportErrorText(error)
           : error === "rate_limited" ? "Rate limited; it won't be retried."
           : "Check the plugin log for details.";
         toaster.toast({ title: `Auto-upload to ${service} failed`, body: `${filename}: ${reason}` });
       }
     }
   );
+
+  const storageAlertListener = addEventListener<[threshold: number, kind?: string]>(
+    "storage_threshold_reached",
+    showStorageAlert
+  );
+  const autoDeleteListener = addEventListener<[count: number, kind?: string]>("auto_delete_performed", showAutoDeleted);
 
   return {
     name: "Omni-Revi-Transfer",
@@ -1872,6 +2245,8 @@ export default definePlugin(() => {
     onDismount() {
       steamScreenshotRegistration?.unregister();
       removeEventListener("auto_upload_result", autoUploadListener);
+      removeEventListener("storage_threshold_reached", storageAlertListener);
+      removeEventListener("auto_delete_performed", autoDeleteListener);
     },
   };
 });

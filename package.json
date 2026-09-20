@@ -1,7 +1,7 @@
 {
   "name": "omni-revi-transfer",
-  "version": "0.0.9b",
-  "description": "Browse, manage, and share your Steam Deck's native screenshots (gallery, storage limit, local QR sharing) from the Decky Quick Access Menu.",
+  "version": "1.0.0",
+  "description": "Browse, manage, and share your Steam Deck's screenshots and game recordings (QR, Steam, Discord, Google Drive, MP4 export, storage limits) from the Decky Quick Access Menu.",
   "type": "module",
   "scripts": {
     "build": "rollup -c",
@@ -21,6 +21,7 @@
     "steam-deck",
     "deck",
     "screenshots",
+    "recordings",
     "qr-share"
   ],
   "author": "Revivedx",

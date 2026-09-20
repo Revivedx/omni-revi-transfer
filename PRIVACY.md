@@ -1,6 +1,6 @@
 # Privacy Policy — Omni-Revi-Transfer
 
-**Last updated:** 2026-09-18 (plugin version 0.0.9b)
+**Last updated:** 2026-09-20 (plugin version 1.0.0)
 
 Omni-Revi-Transfer ("the plugin") is a [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) plugin for the Steam Deck. It runs entirely on the user's own device. This document explains what data the plugin touches, how the optional Google Drive, Discord and Steam features work, and how to contact us.
 
@@ -13,6 +13,7 @@ Omni-Revi-Transfer ("the plugin") is a [Decky Loader](https://github.com/SteamDe
 ## What the plugin accesses on the device
 
 - **Steam's own screenshot files**, already saved locally by Steam itself (Steam button + R1/RB), under the standard `userdata/<account>/760/remote/<appid>/screenshots/` path. The plugin reads this folder to build the in-app gallery, and can delete a file from it only when the user explicitly taps "Delete" on that screenshot.
+- **Steam's game recordings**, saved locally by Steam under `userdata/<account>/gamerecordings/clips/`. The plugin lists them and can delete a clip's folder only when the user explicitly taps "Delete" on it, or when the optional, off-by-default "auto-delete oldest recordings" setting is on.
 - **A local settings file** (storage-limit preference, auto-delete toggle, QR share duration, auto-upload and Steam upload preferences) stored inside the plugin's own Decky-managed settings directory on the Deck, plus, only if the user links them, an obfuscated Google session token and Discord webhook address, and the client ID/secret of the user's own Google and Discord apps if they enter them, in the same directory.
 - Nothing outside of Steam's own screenshots folder and the plugin's own settings folder is read, written, or scanned.
 
@@ -24,12 +25,16 @@ When the user chooses "Share via QR" for a screenshot, the plugin starts a tempo
 - Shuts itself down automatically after the first successful download (with a short grace period) or after a short timeout if nobody downloads it.
 - Never leaves the local network; no screenshot or file data is transmitted to the developer or to any third-party server.
 
+## Game recordings and MP4 export
+
+Steam keeps a saved clip as separate video and audio pieces. To share one, the plugin runs `ffmpeg` (the copy that SteamOS ships) on the Deck to join them, and optionally re-encode them, into one `.mp4`. That file is created in the plugin's own runtime folder, sent where the user chose (the local QR feature, Google Drive, or Discord), and deleted right after. Leftovers of an interrupted export are deleted the next time the plugin starts. "Save MP4 to Videos" writes the file into the user's own Videos folder instead, and it is then the user's to keep or delete. Nothing about recordings is sent to the developer, and `ffmpeg` runs entirely on the device.
+
 ## Google Drive integration (optional, off unless the user links it)
 
 Omni-Revi-Transfer optionally lets a user upload a screenshot to **their own** Google Drive. This feature is entirely opt-in:
 
-- **What we access:** the plugin requests only the [`drive.file`](https://developers.google.com/drive/api/guides/api-specific-auth) OAuth scope — the narrowest scope Google Drive offers. This scope only ever grants access to files and folders that this plugin itself creates in the user's Drive (organized under a `omni-revi-transfer/screenshots/<Game Name>` folder structure it creates on first upload). The plugin cannot see, list, read, or modify any other file already in the user's Drive.
-- **What we upload:** only the specific screenshot file the user explicitly chooses to upload, at the moment they choose to upload it. Nothing is uploaded automatically or in the background unless the user turns on the optional Auto-upload setting described below.
+- **What we access:** the plugin requests only the [`drive.file`](https://developers.google.com/drive/api/guides/api-specific-auth) OAuth scope — the narrowest scope Google Drive offers. This scope only ever grants access to files and folders that this plugin itself creates in the user's Drive (organized under a `omni-revi-transfer/screenshots/<Game Name>` or `omni-revi-transfer/recordings/<Game Name>` folder structure it creates on first upload). The plugin cannot see, list, read, or modify any other file already in the user's Drive.
+- **What we upload:** only the specific screenshot or recording (as an `.mp4`) the user explicitly chooses to upload, at the moment they choose to upload it. Nothing is uploaded automatically or in the background unless the user turns on the optional Auto-upload setting described below.
 - **Whose Google app:** the plugin ships no Google credentials. Each user creates their own Google Cloud project and OAuth client and enters its client ID and secret in the plugin, where they are stored only on the user's Steam Deck (obfuscated). The developer's Google project is not involved and the developer receives nothing.
 - **Where the session is stored:** signing in uses Google's OAuth "device flow" (the user approves access on their own phone/browser, not by giving the plugin a password). Google then issues a long-lived refresh token, which is stored **locally on the user's own Steam Deck only** — never transmitted to the developer or to any server other than Google's own OAuth endpoints. That local file is obfuscated at rest (not left as human-readable plaintext) as a defense-in-depth measure against casual exposure, though this is disclosed to the user as obfuscation rather than strong encryption before they link their account, alongside an explicit warning about what a compromised device could mean for that saved session.
 - **Revoking access:** the user can unlink Google Drive at any time from the plugin's Share options panel. This deletes the locally stored session and revokes the token with Google directly, exactly like removing an app from your [Google Account's connected apps list](https://myaccount.google.com/permissions).
@@ -42,7 +47,7 @@ Omni-Revi-Transfer optionally lets a user post a screenshot to a Discord channel
 - **What we access:** the plugin requests only the `webhook.incoming` OAuth scope. It lets Discord create a webhook in the one channel the user selects; it does not let the plugin read messages, servers, or any account information.
 - **Whose Discord app:** likewise, each user creates their own Discord application and enters its ID and secret in the plugin; they stay on the user's Deck only.
 - **What we store:** only the resulting webhook URL, on the user's own Steam Deck, obfuscated at rest (disclosed as obfuscation, not strong encryption, before linking). Discord's access token is discarded immediately and never stored. Nothing is sent to the developer.
-- **What we upload:** only the screenshot the user explicitly chooses to send, plus its game name as the message text, directly from the Deck to Discord.
+- **What we upload:** only the screenshot or recording (as an `.mp4`, shrunk to the user's chosen size limit) the user explicitly chooses to send, plus its game name as the message text, directly from the Deck to Discord.
 - **Revoking access:** "Unlink Discord" deletes the webhook on Discord and the local copy. The user can also delete the webhook at any time in the channel's Integrations settings, or remove the app under Discord's Authorized Apps.
 
 ## Steam sharing (optional)
@@ -51,7 +56,7 @@ The plugin can upload a screenshot the user chooses to **their own Steam account
 
 ## Optional automatic upload
 
-For Steam, and for each linked service (Google Drive, Discord), the user can turn on an "Auto-upload" setting, **off by default**. While it is on, each new screenshot taken while the plugin is running is uploaded to that service after a delay the user chooses (5 to 60 seconds, 10 by default), without a per-screenshot confirmation. Screenshots that existed before the setting was turned on are never uploaded automatically. The setting can be switched off at any time, and unlinking a service switches it off. Uploads go directly from the user's Deck to the chosen service, as described in the sections above; nothing is sent to the developer.
+For Steam (screenshots only), and for each linked service (Google Drive, Discord), the user can turn on an "Auto-upload" setting for screenshots, recordings or both, **off by default**. While it is on, each new screenshot or recording made while the plugin is running is uploaded to that service after a delay the user chooses (5 to 60 seconds, 10 by default), without a per-screenshot confirmation. Screenshots and recordings that existed before the setting was turned on are never uploaded automatically. The setting can be switched off at any time, and unlinking a service switches it off. Uploads go directly from the user's Deck to the chosen service, as described in the sections above; nothing is sent to the developer.
 
 ## Installer (optional)
 

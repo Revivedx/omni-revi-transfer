@@ -5,6 +5,6 @@
   "api_version": 1,
   "publish": {
     "tags": ["screenshots", "utility", "sharing"],
-    "description": "Browse, manage, and share your Steam Deck's native screenshots (gallery, storage limit, local QR sharing) from the Quick Access Menu."
+    "description": "Browse, manage, and share your Steam Deck's screenshots and game recordings (QR, Steam, Discord, Google Drive, MP4 export, storage limits) from the Quick Access Menu."
   }
 }

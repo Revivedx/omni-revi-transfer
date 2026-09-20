@@ -39,6 +39,8 @@ To run the plugin on your own devices (another Deck, or another Linux PC with De
 | [`qrcode-generator`](https://www.npmjs.com/package/qrcode-generator) | Fully local, dependency-free QR code rendering |
 | `tslib` | TypeScript helper runtime |
 
+**Recordings:** `ffmpeg`, which SteamOS ships and the plugin runs as a program (it is not bundled and not a Python package). Without it, recordings are listed but cannot be shared or saved as MP4.
+
 **Backend:** Python standard library only (`asyncio`, `socket`, `secrets`, `shutil`, `json`, `re`, `base64`, `hashlib`, `ssl`, `urllib.request`/`urllib.parse`) plus the `decky` module Decky Loader itself provides. No pip packages are vendored.
 
 **Dev tooling:**
@@ -51,7 +53,7 @@ To run the plugin on your own devices (another Deck, or another Linux PC with De
 
 ## Publishing a release
 
-1. Bump `version` in `package.json`, add the entry to `CHANGELOG.md`, and refresh the **Latest update** section of the README and the version in `PRIVACY.md`.
+1. Bump `version` in `package.json`, add the entry to `CHANGELOG.md`, and refresh the **Latest update** section of the README and the version and date in `PRIVACY.md`.
 2. `npm run package`.
 3. Create a GitHub Release tagged `vX.Y.Z` and attach **three files** from `release/`: `omni-revi-transfer-vX.Y.Z.zip`, `Omni-Revi-Transfer-Installer.desktop` and `omni-revi-transfer-installer.sh`. The installer looks for an asset named `omni-revi-transfer-v*.zip` in the latest release, and the `.desktop` fetches the script from the `main` branch when it isn't next to it.
 4. **Never** attach the `-personal` zip: it contains your OAuth credentials.

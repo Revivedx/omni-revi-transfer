@@ -2,6 +2,30 @@
 
 All notable changes to Omni-Revi-Transfer are documented in this file. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.0.0] - 2026-09-20
+
+The plugin now covers everything it was meant to. From here on, releases are hotfixes.
+
+### Added
+- **Recordings.** A new **Recordings** list, next to **Screenshots** (the old "Gallery"), shows the clips saved with Steam's own game recording: newest first, five per page, with the game name, length and size. Each one has the same **Share** and **Delete** as a screenshot. Share offers **QR Code**, **Google Drive** (`omni-revi-transfer/recordings/<Game>`), **Discord** and **Save MP4 to Videos**. Steam cannot take a video, so the Steam options are not offered. Steam stores a clip as separate video and audio pieces, so it is turned into one `.mp4` with the `ffmpeg` that SteamOS ships. That file only exists while it is being sent and is deleted afterwards.
+- **Video export panel** (under Storage): **Quality** (Original joins the pieces without re-encoding; Smaller and Smallest re-encode to H.264), **Maximum resolution** (as recorded, 720p, 480p), **Encoder** (software x264, or the Deck's hardware encoder with a fallback to software), **Crop to 16:9** for recordings made at the Deck's 16:10 shape, **Discord size limit** (10, 25, 50 or 100 MB, or never shrink) and **A folder per game** for Save MP4. A clip that would exceed the Discord limit is re-encoded to fit; one too long to fit at a watchable quality is refused with a clear message. Warning labels state the approximate RAM and CPU a re-encode uses, for manual sharing and for auto-upload.
+- **Auto-upload of recordings.** Each auto-upload service now has a dropdown: **Off**, **Screenshots only**, **Recordings only** or **Screenshots and recordings** (Steam only takes screenshots). A new clip is uploaded once Steam has finished writing it, after the delay chosen for that service; clips that already existed are never uploaded. Existing on/off toggles carry over as "Screenshots only".
+- **Storage for recordings.** The Storage panel has a second block with its own warning limit (default 10 GB), alerts at 80/90/100% and an optional auto-delete that removes the oldest clips first and never the newest one. The temporary MP4 files and videos saved to the Videos folder are not counted. Recordings are also checked in the background, every 10 seconds, because a clip can be saved at any time.
+- **Repeated alert while over the limit.** Steam keeps saving files whatever a plugin says, so when a limit is exceeded and auto-delete is off, the alert is now repeated for each new screenshot or clip instead of only the first time. These alerts, and the auto-delete notice, now appear while the Quick Access Menu is closed (before, only while it was open). Screenshots also apply the limit right when Steam reports a new one.
+
+### Changed
+- **Gallery** is now **Screenshots**.
+- Large files are streamed instead of loaded into memory: Google Drive uses its resumable upload above 4 MB, Discord sends the file in blocks, and the QR server sends in blocks and supports `Range` requests, so a recording of hundreds of MB does not raise the plugin's memory.
+- Re-encoding runs at low priority on one thread with a short look-ahead, and the audio is copied unchanged. Measured on a Deck with a 27 s 720p clip, that used about 55% less CPU time and 44% less memory (about 170 MB) than two threads, for a slightly smaller file.
+- A clip folder Steam leaves without any video (which happens when it cannot record) is hidden instead of listed.
+- Plugin footprint at idle on a Deck: about 18 MB PSS (39 MB RSS) with auto-upload on, against about 16 MB (37 MB) in 0.0.9b.
+
+### Credits
+- The export quality steps (x264 quality and speed presets, copying the audio, cropping 16:10 to 16:9, folders per game) were inspired by [decky-video-uploader](https://github.com/SootyOwl/decky-video-uploader) by SootyOwl (BSD-3-Clause), which reads Steam's recordings and exports them to MP4 and YouTube. No code was copied.
+
+### Notes
+- **No hard storage limit.** Stopping Steam from saving once a limit is reached is not possible from a plugin: Steam has no setting or API for it. Making its recording folders read-only was tried on a Deck, and Steam then failed without telling the user, leaving empty clip entries or unfinished video behind. The limits are therefore a warning plus an optional auto-delete.
+
 ## [0.0.9b] - 2026-09-20
 
 ### Fixed

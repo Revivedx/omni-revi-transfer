@@ -25,12 +25,14 @@ import asyncio
 import base64
 import functools
 import hashlib
+import io
 import json
 import os
 import re
 import secrets
 import shutil
 import socket
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -357,6 +359,10 @@ def _extract_appid_from_screenshot_path(real_path: str) -> Optional[str]:
     return appid if appid.isdigit() else None
 
 
+def _guess_mime(path: str) -> str:
+    return {".png": "image/png", ".mp4": "video/mp4"}.get(os.path.splitext(path)[1].lower(), "image/jpeg")
+
+
 def _file_to_data_uri(path: str) -> str:
     ext = os.path.splitext(path)[1].lower()
     mime = "image/png" if ext == ".png" else "image/jpeg"
@@ -413,7 +419,7 @@ async def _enforce_auto_delete(settings: dict) -> int:
 
     if deleted:
         decky.logger.info(f"Auto-delete: removed {deleted} screenshot(s) for exceeding the limit.")
-        await decky.emit("auto_delete_performed", deleted)
+        await decky.emit("auto_delete_performed", deleted, "screenshots")
     return deleted
 
 
@@ -426,24 +432,443 @@ async def _enforce_auto_delete(settings: dict) -> int:
 STORAGE_ALERT_THRESHOLDS = (100, 90, 80)
 
 
-async def _check_storage_alerts() -> None:
+async def _check_storage_alerts(kind: str = "screenshots", new_item: bool = False) -> None:
+    """kind is "screenshots" or "recordings": each has its own limit and its own alert memory.
+    Steam keeps saving files whatever the limit says, so with `new_item` (a
+    screenshot or clip was just saved) and the limit already exceeded, the
+    alert is repeated once for that file instead of only when the limit is
+    first crossed. With auto-delete on there is nothing to warn about."""
     settings = _load_settings()
-    if settings.get("max_storage_mb", 0) == 0:
+    limit_key, memory_key = (
+        ("max_storage_mb", "_last_storage_alert") if kind == "screenshots"
+        else ("max_recordings_mb", "_last_recordings_alert")
+    )
+    if settings.get(limit_key, 0) == 0:
         return  # Unlimited: no threshold makes sense against no limit.
-    limit_bytes = settings["max_storage_mb"] * 1024 * 1024
-    used_bytes = _total_storage_bytes()
+    limit_bytes = settings[limit_key] * 1024 * 1024
+    used_bytes = _total_storage_bytes() if kind == "screenshots" else await _run_blocking(_recordings_total_bytes)
     pct = (used_bytes / limit_bytes * 100) if limit_bytes else 0
-    last_alerted = settings.get("_last_storage_alert", 0)
+    last_alerted = settings.get(memory_key, 0)
 
     crossed = next((t for t in STORAGE_ALERT_THRESHOLDS if pct >= t > last_alerted), None)
     if crossed is not None:
-        settings["_last_storage_alert"] = crossed
+        settings[memory_key] = crossed
         _save_settings(settings)
-        decky.logger.info(f"Storage alert: usage crossed {crossed}% ({pct:.1f}% used).")
-        await decky.emit("storage_threshold_reached", crossed)
+        decky.logger.info(f"Storage alert ({kind}): usage crossed {crossed}% ({pct:.1f}% used).")
+        await decky.emit("storage_threshold_reached", crossed, kind)
+    elif new_item and pct >= 100 and not settings.get("auto_delete" if kind == "screenshots" else "auto_delete_recordings"):
+        await decky.emit("storage_threshold_reached", 100, kind)
     elif pct < 80 and last_alerted:
-        settings["_last_storage_alert"] = 0
+        settings[memory_key] = 0
         _save_settings(settings)
+
+
+# --- Game recordings (Steam's own Game Recording) ----------------------------
+#
+# A clip saved from Steam's recording feature lives in
+# userdata/<account>/gamerecordings/clips/clip_<appid>_<date>_<time>/ as a
+# thumbnail plus a DASH stream (session.mpd with separate video and audio
+# chunks), not as one video file. To share one, ffmpeg (shipped with SteamOS)
+# copies the streams into a single .mp4 without re-encoding, which takes well
+# under a second. The mp4 only exists for the moment it is being sent.
+
+_CLIP_DIR_RE = re.compile(r"^clip_(\d+)_(\d{8})_(\d{6})$")
+RECORDING_EXPORT_DIR = os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "exports")
+_EXPORT_TIMEOUT_SECONDS = 300
+
+
+def _recordings_root() -> Optional[str]:
+    account_id = _detect_steam_account_id()
+    if account_id is None:
+        return None
+    root = os.path.join(STEAM_USERDATA_ROOT, account_id, "gamerecordings", "clips")
+    return root if os.path.isdir(root) else None
+
+
+def _list_recordings() -> list:
+    """[(clip folder, appid)] newest first (the folder name carries the date and time)."""
+    root = _recordings_root()
+    if root is None:
+        return []
+    found = []
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    for name in names:
+        match = _CLIP_DIR_RE.match(name)
+        path = os.path.join(root, name)
+        # A clip without its video is what Steam leaves behind when it could not
+        # record (for example an unwritable folder): nothing to show or share.
+        if match and os.path.isdir(path) and _recording_mpd(path) is not None:
+            found.append((match.group(2) + match.group(3), path, match.group(1)))
+    found.sort(reverse=True)
+    return [(path, appid) for _, path, appid in found]
+
+
+def _is_inside_recordings(path: str) -> Optional[str]:
+    """Returns the real path if it is one of the clip folders under gamerecordings/clips."""
+    root = _recordings_root()
+    if root is None:
+        return None
+    real = os.path.realpath(path)
+    if os.path.dirname(real) != os.path.realpath(root) or not _CLIP_DIR_RE.match(os.path.basename(real)):
+        return None
+    return real if os.path.isdir(real) else None
+
+
+def _recording_appid(clip_dir: str) -> str:
+    match = _CLIP_DIR_RE.match(os.path.basename(clip_dir))
+    return match.group(1) if match else "7"
+
+
+def _recording_mpd(clip_dir: str) -> Optional[str]:
+    """The clip's session.mpd, or None while Steam has not finished writing it."""
+    video_root = os.path.join(clip_dir, "video")
+    try:
+        for name in sorted(os.listdir(video_root)):
+            candidate = os.path.join(video_root, name, "session.mpd")
+            if os.path.isfile(candidate):
+                return candidate
+    except OSError:
+        pass
+    return None
+
+
+def _recording_size(clip_dir: str) -> int:
+    total = 0
+    for folder, _, files in os.walk(clip_dir):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(folder, name))
+            except OSError:
+                pass
+    return total
+
+
+def _recording_duration(clip_dir: str) -> Optional[float]:
+    mpd = _recording_mpd(clip_dir)
+    if mpd is None:
+        return None
+    try:
+        with open(mpd, "r", encoding="utf-8", errors="ignore") as f:
+            head = f.read(4096)
+    except OSError:
+        return None
+    match = re.search(r'mediaPresentationDuration="PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?"', head)
+    if not match:
+        return None
+    hours, minutes, seconds = match.groups()
+    return int(hours or 0) * 3600 + int(minutes or 0) * 60 + float(seconds or 0)
+
+
+def _delete_recording(clip_dir: str) -> bool:
+    """Deletes a clip folder. `clip_dir` must already be a validated real path."""
+    try:
+        shutil.rmtree(clip_dir)
+        return True
+    except OSError as e:
+        decky.logger.warning(f"Could not delete {clip_dir}: {e}")
+        return False
+
+
+# clip folder -> (folder modification time in ns, size). A finished clip never
+# changes, so its size is walked once; the limit checks then only stat each folder.
+_clip_size_cache: dict = {}
+
+
+def _recording_size_cached(clip_dir: str) -> int:
+    try:
+        mtime = os.stat(clip_dir).st_mtime_ns
+    except OSError:
+        return 0
+    hit = _clip_size_cache.get(clip_dir)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    size = _recording_size(clip_dir)
+    # Only trust it once the folder has been still for a while (Steam may still be copying files into it).
+    if time.time_ns() - mtime > _INDEX_STABLE_NS:
+        _clip_size_cache[clip_dir] = (mtime, size)
+    return size
+
+
+def _recordings_total_bytes() -> int:
+    """What Steam's saved clips take. The mp4 files made for sharing are not
+    counted: they only exist while being sent. Neither is the background
+    recording buffer, which Steam manages itself."""
+    paths = [path for path, _ in _list_recordings()]
+    for stale in set(_clip_size_cache) - set(paths):
+        del _clip_size_cache[stale]
+    return sum(_recording_size_cached(path) for path in paths)
+
+
+async def _enforce_recordings_auto_delete(settings: dict) -> int:
+    """If auto-delete is on for recordings and the limit was exceeded, deletes
+    the oldest clips until back under it. The newest clip is never deleted, so
+    a clip that was just saved cannot be removed by its own size. Returns how
+    many clips were deleted."""
+    if not settings.get("auto_delete_recordings") or settings.get("max_recordings_mb", 0) == 0:
+        return 0
+    limit_bytes = settings["max_recordings_mb"] * 1024 * 1024
+    clips = await _run_blocking(_list_recordings)  # newest first
+    sizes = [(path, await _run_blocking(_recording_size_cached, path)) for path, _ in clips]
+    total = sum(size for _, size in sizes)
+    if total <= limit_bytes:
+        return 0
+    deleted = 0
+    for path, size in reversed(sizes[1:]):  # oldest first, never the newest
+        if total <= limit_bytes:
+            break
+        if _delete_recording(path):
+            total -= size
+            deleted += 1
+    if deleted:
+        decky.logger.info(f"Auto-delete: removed {deleted} recording(s) for exceeding the limit.")
+        await decky.emit("auto_delete_performed", deleted, "recordings")
+    return deleted
+
+
+def _ffmpeg_path() -> Optional[str]:
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    return next((p for p in ("/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg") if os.path.isfile(p)), None)
+
+
+def _clean_subprocess_env() -> dict:
+    """Decky is a bundled program that points LD_LIBRARY_PATH at its own copies
+    of some libraries; ffmpeg must use the system's."""
+    env = dict(os.environ)
+    if "LD_LIBRARY_PATH_ORIG" in env:
+        env["LD_LIBRARY_PATH"] = env["LD_LIBRARY_PATH_ORIG"]
+    else:
+        env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
+# How a recording is turned into an mp4 (Settings -> Video export).
+#
+# "original" copies the streams as they are (instant, biggest file). "smaller"
+# and "smallest" re-encode to H.264. The quality steps (CRF 24 / 30 with the
+# fast / veryfast x264 presets, and copying the audio) follow the ranges the
+# decky-video-uploader plugin by SootyOwl offers for its "smaller" / "smallest"
+# exports: https://github.com/SootyOwl/decky-video-uploader (BSD-3-Clause).
+# Re-encoding is also what fits a video under Discord's upload limit.
+#
+# quality -> (x264 CRF, x264 preset, VAAPI quantizer)
+#
+# The encoder is held to one thread with a short look-ahead on purpose: on a
+# Deck an encode can run while a game is being played. Measured on a 27 s 720p
+# clip, against two encoder threads and the default look-ahead, that took
+# about 60% less CPU time and 45% less memory (170 MB instead of 305 MB) for a
+# slightly smaller file, at the price of a slower encode.
+_EXPORT_PROFILES = {
+    "original": ("20", "veryfast", 24),  # only used when a crop or the size limit forces a re-encode
+    "smaller": ("24", "veryfast", 28),
+    "smallest": ("30", "veryfast", 33),
+}
+_AUDIO_KBPS = 128  # the recording's audio, which is copied and never re-encoded
+_VAAPI_DEVICE = "/dev/dri/renderD128"
+
+
+def _recording_video_size(mpd: str) -> tuple:
+    """(width, height) of the recording's video, or (None, None)."""
+    try:
+        with open(mpd, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read(8192)
+    except OSError:
+        return None, None
+    tag = re.search(r'<Representation[^>]*mimeType="video/[^"]*"[^>]*>', text)
+    if not tag:
+        return None, None
+    width = re.search(r'\bwidth="(\d+)"', tag.group(0))
+    height = re.search(r'\bheight="(\d+)"', tag.group(0))
+    return (int(width.group(1)), int(height.group(1))) if width and height else (None, None)
+
+
+def _video_filters(width, height, crop_16_9: bool, max_height: int) -> tuple:
+    """(ffmpeg filters, height after them, whether a filter changes the picture)."""
+    filters = []
+    if crop_16_9 and width and height and abs(width / height - 1.6) < 0.02:
+        # The Deck's own 16:10 screen becomes 16:9, as most players and sites expect.
+        height = int(width * 9 / 16)
+        height -= height % 2
+        filters.append(f"crop={width}:{height}")
+    if max_height and height and height > max_height:
+        filters.append(f"scale=-2:{max_height}")
+        height = max_height
+    return filters, height, bool(filters)
+
+
+def _fit_bitrate_kbps(limit_bytes: int, duration: Optional[float]) -> Optional[int]:
+    """Video bitrate that keeps a clip of this length under the limit, or None
+    when the clip is too long for any watchable quality."""
+    if not duration or duration <= 0:
+        return None
+    # 7% margin: the encoder overshoots its target a little and the mp4 has overhead.
+    kbps = int(limit_bytes * 8 * 0.93 / duration / 1000) - _AUDIO_KBPS
+    return kbps if kbps >= 150 else None
+
+
+def _ffmpeg_command(
+    ffmpeg: str, mpd: str, out_path: str, encode: bool, hardware: bool, quality: str,
+    filters: list, bitrate_kbps: Optional[int],
+) -> list:
+    base = [ffmpeg, "-nostdin", "-loglevel", "error", "-y"]
+    if not encode:
+        return base + ["-i", mpd, "-c", "copy", "-movflags", "+faststart", out_path]
+    crf, preset, qp = _EXPORT_PROFILES[quality]
+    if hardware:
+        base += ["-vaapi_device", _VAAPI_DEVICE]
+    cmd = base + (["-i", mpd] if hardware else ["-threads", "1", "-filter_threads", "1", "-i", mpd])
+    chain = list(filters) + (["format=nv12", "hwupload"] if hardware else [])
+    if chain:
+        cmd += ["-vf", ",".join(chain)]
+    if hardware:
+        cmd += ["-c:v", "h264_vaapi"]
+        cmd += ["-b:v", f"{bitrate_kbps}k", "-maxrate", f"{bitrate_kbps}k"] if bitrate_kbps else ["-qp", str(qp)]
+    else:
+        # One thread and a short look-ahead: this can run while a game is being played.
+        cmd += ["-c:v", "libx264", "-preset", preset, "-threads", "1", "-x264-params", "rc-lookahead=10"]
+        cmd += (
+            ["-b:v", f"{bitrate_kbps}k", "-maxrate", f"{bitrate_kbps}k", "-bufsize", f"{bitrate_kbps * 2}k"]
+            if bitrate_kbps else ["-crf", crf]
+        )
+    cmd += ["-c:a", "copy", "-movflags", "+faststart", out_path]
+    nice = shutil.which("nice")
+    return ([nice, "-n", "19"] if nice else []) + cmd
+
+
+def _run_ffmpeg(cmd: list, timeout: int) -> bool:
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout, env=_clean_subprocess_env())
+    except (OSError, subprocess.TimeoutExpired) as e:
+        decky.logger.warning(f"ffmpeg failed to run: {e!r}")
+        return False
+    if result.returncode != 0:
+        decky.logger.warning(f"ffmpeg export failed ({result.returncode}): {result.stderr.decode('utf-8', errors='ignore')[-300:]}")
+        return False
+    return True
+
+
+def _export_recording_blocking(clip_dir: str, fit_bytes: Optional[int] = None) -> tuple:
+    """Turns a clip into one .mp4 inside a fresh folder under RECORDING_EXPORT_DIR,
+    following the Video export settings. With `fit_bytes` (Discord's limit) the
+    result is re-encoded to fit under that size if it would be bigger.
+    Returns (mp4 path, None) or (None, error) where error is "no_video",
+    "no_ffmpeg", "no_space", "too_large" (the clip is too long to fit the limit)
+    or "export_failed". The caller must delete the mp4's folder (_remove_export)."""
+    mpd = _recording_mpd(clip_dir)
+    if mpd is None:
+        return None, "no_video"
+    ffmpeg = _ffmpeg_path()
+    if ffmpeg is None:
+        decky.logger.warning("ffmpeg was not found; recordings cannot be exported.")
+        return None, "no_ffmpeg"
+    settings = _load_settings()
+    quality = settings["export_quality"]
+    hardware = settings["export_encoder"] == "hardware" and os.path.exists(_VAAPI_DEVICE)
+    width, height = _recording_video_size(mpd)
+    duration = _recording_duration(clip_dir)
+    max_height = settings["export_max_height"] if quality != "original" else 0
+    filters, out_height, cropped = _video_filters(width, height, settings["export_crop_16_9"], max_height)
+    encode = quality != "original" or cropped
+    source_size = _recording_size(clip_dir)
+    try:
+        os.makedirs(RECORDING_EXPORT_DIR, exist_ok=True)
+        if shutil.disk_usage(RECORDING_EXPORT_DIR).free < source_size * 1.1 + 50 * 1024 * 1024:
+            return None, "no_space"
+        out_dir = os.path.join(RECORDING_EXPORT_DIR, secrets.token_hex(8))
+        os.makedirs(out_dir)
+    except OSError as e:
+        decky.logger.warning(f"Could not prepare the export folder: {e}")
+        return None, "export_failed"
+    out_path = os.path.join(out_dir, os.path.basename(clip_dir) + ".mp4")
+    encode_timeout = int(max(600, min(3600, (duration or 300) * 8)))
+
+    def attempt(do_encode: bool, do_filters: list, bitrate: Optional[int]) -> bool:
+        # Hardware first when asked for; any failure falls back to software.
+        for use_hardware in ([True, False] if (do_encode and hardware) else [False]):
+            if os.path.exists(out_path):
+                os.remove(out_path)
+            cmd = _ffmpeg_command(ffmpeg, mpd, out_path, do_encode, use_hardware, quality, do_filters, bitrate)
+            if _run_ffmpeg(cmd, encode_timeout if do_encode else _EXPORT_TIMEOUT_SECONDS) and os.path.isfile(out_path):
+                return True
+        return False
+
+    def fail(error: str) -> tuple:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return None, error
+
+    # A plain copy of a clip that is already over the limit cannot fit: skip straight to shrinking it.
+    needs_fit = bool(fit_bytes) and not encode and source_size > fit_bytes
+    if not needs_fit:
+        if not attempt(encode, filters, None):
+            return fail("export_failed")
+        needs_fit = bool(fit_bytes) and os.path.getsize(out_path) > fit_bytes
+    if needs_fit:
+        kbps = _fit_bitrate_kbps(fit_bytes, duration)
+        if kbps is None:
+            return fail("too_large")
+        # A low bitrate looks better on a smaller picture than a blocky big one.
+        fit_max_height = 480 if kbps < 1000 else max_height
+        fit_filters, _, _ = _video_filters(width, height, settings["export_crop_16_9"], fit_max_height)
+        if not attempt(True, fit_filters, kbps):
+            return fail("export_failed")
+        if os.path.getsize(out_path) > fit_bytes:
+            return fail("too_large")
+    return out_path, None
+
+
+def _remove_export(mp4_path: Optional[str]) -> None:
+    if mp4_path:
+        shutil.rmtree(os.path.dirname(mp4_path), ignore_errors=True)
+
+
+def _safe_file_name(name: str) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", name).strip(" .")
+    return cleaned or "Recording"
+
+
+def _save_recording_blocking(clip_dir: str) -> tuple:
+    """Exports a clip into the user's Videos folder (in a folder per game if
+    that setting is on). Returns (saved path, None) or (None, error)."""
+    mp4, error = _export_recording_blocking(clip_dir)
+    if mp4 is None:
+        return None, error
+    try:
+        settings = _load_settings()
+        game = _safe_file_name(_resolve_drive_folder_name(_recording_appid(clip_dir)))
+        folder = os.path.join(decky.DECKY_USER_HOME, "Videos")
+        if settings["export_game_folders"]:
+            folder = os.path.join(folder, game)
+        match = _CLIP_DIR_RE.match(os.path.basename(clip_dir))
+        stamp = ""
+        if match:
+            d, t = match.group(2), match.group(3)
+            stamp = f" {d[:4]}-{d[4:6]}-{d[6:]} {t[:2]}-{t[2:4]}-{t[4:]}"
+        os.makedirs(folder, exist_ok=True)
+        dest = os.path.join(folder, f"{game}{stamp}.mp4")
+        n = 1
+        while os.path.exists(dest):
+            n += 1
+            dest = os.path.join(folder, f"{game}{stamp} ({n}).mp4")
+        shutil.move(mp4, dest)
+        if os.geteuid() == 0:  # the backend may run as root; the files belong to the user
+            try:
+                import pwd  # Linux only, and only needed here
+
+                account = pwd.getpwnam(decky.DECKY_USER)
+                for path in {folder, dest}:
+                    os.chown(path, account.pw_uid, account.pw_gid)
+            except (KeyError, OSError) as e:
+                decky.logger.warning(f"Could not hand the saved video to the user: {e}")
+        return dest, None
+    except OSError as e:
+        decky.logger.warning(f"Could not save the recording: {e}")
+        return None, "export_failed"
+    finally:
+        _remove_export(mp4)
 
 
 # --- QR sharing (local HTTP server) ------------------------------------------
@@ -477,6 +902,7 @@ async def _handle_share_request(
     file_path: str,
     content_type: str,
     on_downloaded,
+    download_name: Optional[str] = None,
 ) -> None:
     """Minimal hand-rolled HTTP GET server.
 
@@ -486,15 +912,21 @@ async def _handle_share_request(
     internally depends on `http.server`). `socket` and `asyncio` are
     available, so this implements the bare minimum: parse the request line,
     serve the file if the name exactly matches the expected token, and close
-    the connection.
+    the connection. The file is streamed in blocks (a recording can be
+    hundreds of MB) and a single `Range: bytes=` request is honoured, which
+    phone browsers use for video.
     """
     served = False
     try:
         request_line = await reader.readline()
+        range_header = ""
         while True:
             line = await reader.readline()
             if line in (b"\r\n", b"\n", b""):
                 break
+            name, _, value = line.decode("latin-1").partition(":")
+            if name.strip().lower() == "range":
+                range_header = value.strip()
 
         try:
             method, raw_path, _ = request_line.decode("latin-1").split(None, 2)
@@ -508,18 +940,47 @@ async def _handle_share_request(
             await writer.drain()
             return
 
-        with open(file_path, "rb") as f:
-            data = f.read()
+        file_size = os.path.getsize(file_path)
+        start, end, status = 0, file_size - 1, "200 OK"
+        range_match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header)
+        if range_match and (range_match.group(1) or range_match.group(2)) and file_size > 0:
+            if range_match.group(1):
+                start = int(range_match.group(1))
+                end = min(int(range_match.group(2)), file_size - 1) if range_match.group(2) else file_size - 1
+            else:  # "bytes=-N": the last N bytes
+                start = max(0, file_size - int(range_match.group(2)))
+            if start > end or start >= file_size:
+                writer.write(
+                    f"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{file_size}\r\n"
+                    f"Connection: close\r\n\r\n".encode("latin-1")
+                )
+                await writer.drain()
+                return
+            status = "206 Partial Content"
 
+        length = end - start + 1
         header = (
-            f"HTTP/1.1 200 OK\r\n"
+            f"HTTP/1.1 {status}\r\n"
             f"Content-Type: {content_type}\r\n"
-            f"Content-Length: {len(data)}\r\n"
-            f"Connection: close\r\n\r\n"
+            f"Content-Length: {length}\r\n"
+            f"Accept-Ranges: bytes\r\n"
+            + (f"Content-Range: bytes {start}-{end}/{file_size}\r\n" if status.startswith("206") else "")
+            + (f'Content-Disposition: attachment; filename="{download_name}"\r\n' if download_name else "")
+            + "Connection: close\r\n\r\n"
         ).encode("latin-1")
-        writer.write(header + data)
-        await writer.drain()
-        served = True
+        writer.write(header)
+        with open(file_path, "rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                block = f.read(min(256 * 1024, remaining))
+                if not block:
+                    break
+                writer.write(block)
+                await writer.drain()
+                remaining -= len(block)
+        # A small probe of the file's tail (some browsers do that before playing a video) is not the download.
+        served = remaining == 0 and end == file_size - 1 and (status == "200 OK" or length >= min(file_size, 1024 * 1024))
     except (OSError, ConnectionError) as e:
         decky.logger.debug(f"share-server: connection interrupted: {e}")
     finally:
@@ -547,7 +1008,14 @@ class _ShareServer:
         self._server: Optional[asyncio.AbstractServer] = None
         self._auto_stop_task: Optional[asyncio.Task] = None
 
-    async def start(self, file_path: str, duration_seconds: int = SHARE_DEFAULT_DURATION_SECONDS) -> Optional[str]:
+    async def start(
+        self,
+        file_path: str,
+        duration_seconds: int = SHARE_DEFAULT_DURATION_SECONDS,
+        move: bool = False,
+        download_name: Optional[str] = None,
+    ) -> Optional[str]:
+        """`move` hands over a temporary file (an exported recording) instead of copying it."""
         await self.stop()  # only one file is shared at a time
 
         shutil.rmtree(SHARE_STAGING_DIR, ignore_errors=True)
@@ -555,8 +1023,12 @@ class _ShareServer:
         ext = os.path.splitext(file_path)[1].lower()
         public_name = secrets.token_urlsafe(16) + ext
         staged_path = os.path.join(SHARE_STAGING_DIR, public_name)
-        shutil.copyfile(file_path, staged_path)
-        content_type = "image/png" if ext == ".png" else "image/jpeg"
+        if move:
+            shutil.move(file_path, staged_path)
+            _remove_export(file_path)
+        else:
+            shutil.copyfile(file_path, staged_path)
+        content_type = _guess_mime(staged_path)
 
         def on_downloaded() -> None:
             decky.logger.info(
@@ -575,6 +1047,7 @@ class _ShareServer:
             file_path=staged_path,
             content_type=content_type,
             on_downloaded=on_downloaded,
+            download_name=download_name,
         )
         try:
             self._server = await asyncio.start_server(handler, "0.0.0.0", 0)
@@ -844,12 +1317,14 @@ def _drive_folder_usable(access_token: str, folder_id: str) -> bool:
     return not result.get("trashed")
 
 
-async def _get_drive_game_folder_id(access_token: str, appid: str, _retry: bool = True) -> Optional[str]:
-    """Returns the id of "omni-revi-transfer/screenshots/<Game Name>" in the
-    user's Drive, creating any of the three levels on first use and caching
-    their ids locally afterwards (one folder id per game name, plus the two
-    shared parent folder ids). A cached folder the user has since deleted or
-    trashed is detected and recreated."""
+async def _get_drive_game_folder_id(
+    access_token: str, appid: str, section: str = "screenshots", _retry: bool = True
+) -> Optional[str]:
+    """Returns the id of "omni-revi-transfer/<section>/<Game Name>" in the
+    user's Drive (section is "screenshots" or "recordings"), creating any of
+    the three levels on first use and caching their ids locally afterwards
+    (one folder id per game name, plus the shared parent folder ids). A cached
+    folder the user has since deleted or trashed is detected and recreated."""
     token_data = _load_google_token()
     if token_data is None:
         return None
@@ -863,29 +1338,31 @@ async def _get_drive_game_folder_id(access_token: str, appid: str, _retry: bool 
         token_data["root_folder_id"] = root_id
         _save_google_token(token_data)
 
-    screenshots_id = token_data.get("screenshots_folder_id")
+    section_key = f"{section}_folder_id"
+    screenshots_id = token_data.get(section_key)
     if not screenshots_id:
-        screenshots_id = await _run_blocking(_get_or_create_drive_folder, access_token, "screenshots", root_id)
+        screenshots_id = await _run_blocking(_get_or_create_drive_folder, access_token, section, root_id)
         if screenshots_id is None:
-            decky.logger.warning("Google Drive: could not create/find the screenshots subfolder.")
+            decky.logger.warning(f"Google Drive: could not create/find the {section} subfolder.")
             return None
-        token_data["screenshots_folder_id"] = screenshots_id
+        token_data[section_key] = screenshots_id
         _save_google_token(token_data)
 
     # Keyed by name as well as appid: when a game's name gets resolved (or
     # changes), the folder must follow the name instead of the stale one.
     game_name = _resolve_drive_folder_name(appid)
-    cache_key = f"{appid}|{game_name}"
+    # Screenshots keep the original key format so existing folders are found again.
+    cache_key = f"{appid}|{game_name}" if section == "screenshots" else f"{section}|{appid}|{game_name}"
     game_folder_ids = token_data.get("game_folder_ids", {})
     cached_game_id = game_folder_ids.get(cache_key)
     if cached_game_id:
         if await _run_blocking(_drive_folder_usable, access_token, cached_game_id):
             return cached_game_id
         if _retry:
-            for stale_key in ("root_folder_id", "screenshots_folder_id", "game_folder_ids"):
+            for stale_key in ("root_folder_id", "screenshots_folder_id", "recordings_folder_id", "game_folder_ids"):
                 token_data.pop(stale_key, None)
             _save_google_token(token_data)
-            return await _get_drive_game_folder_id(access_token, appid, _retry=False)
+            return await _get_drive_game_folder_id(access_token, appid, section, _retry=False)
 
     game_id = await _run_blocking(_get_or_create_drive_folder, access_token, game_name, screenshots_id)
     if game_id is None:
@@ -898,11 +1375,59 @@ async def _get_drive_game_folder_id(access_token: str, appid: str, _retry: bool 
     return game_id
 
 
+# Above this size a file is sent with Drive's resumable protocol, streamed from
+# disk, instead of being read into memory for one multipart request.
+_DRIVE_MULTIPART_MAX_BYTES = 4 * 1024 * 1024
+GOOGLE_RESUMABLE_URL = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable"
+
+
+def _upload_file_to_drive_resumable(access_token: str, path: str, folder_id: Optional[str]) -> dict:
+    """Blocking upload of a large file: open a resumable session, then send the
+    file in one streamed request (memory use stays flat for a recording of hundreds of MB)."""
+    size = os.path.getsize(path)
+    mime = _guess_mime(path)
+    metadata = {"name": os.path.basename(path)}
+    if folder_id:
+        metadata["parents"] = [folder_id]
+    start = _new_request(
+        GOOGLE_RESUMABLE_URL,
+        data=json.dumps(metadata).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": mime,
+            "X-Upload-Content-Length": str(size),
+        },
+    )
+    try:
+        with _urlopen(start, 30) as resp:
+            session_url = resp.headers.get("Location")
+        if not session_url:
+            return {"ok": False, "error": "upload_failed"}
+        with open(path, "rb") as f:
+            put = _new_request(
+                session_url, data=f, method="PUT",
+                headers={"Content-Type": mime, "Content-Length": str(size)},
+            )
+            with _urlopen(put, 600) as resp:
+                resp.read()
+        return {"ok": True, "error": None}
+    except _http_error() as e:
+        decky.logger.warning(f"Google Drive upload failed ({e.code}): {e.read().decode('utf-8', errors='ignore')}")
+        return {"ok": False, "error": "upload_failed"}
+    except OSError as e:
+        decky.logger.warning(f"Google Drive upload failed: {e}")
+        return {"ok": False, "error": "upload_failed"}
+
+
 def _upload_file_to_drive(access_token: str, path: str, folder_id: Optional[str]) -> dict:
-    """Blocking multipart upload (metadata + content in one request, up to ~5MB)."""
+    """Blocking multipart upload (metadata + content in one request) for small
+    files; larger ones go through the resumable path above."""
+    if os.path.getsize(path) > _DRIVE_MULTIPART_MAX_BYTES:
+        return _upload_file_to_drive_resumable(access_token, path, folder_id)
     filename = os.path.basename(path)
-    ext = os.path.splitext(path)[1].lower()
-    mime = "image/png" if ext == ".png" else "image/jpeg"
+    mime = _guess_mime(path)
     with open(path, "rb") as f:
         file_bytes = f.read()
 
@@ -1104,14 +1629,39 @@ DISCORD_WEBHOOK_URL_PREFIXES = (
 DISCORD_TOKEN_PATH = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "discord.json")
 
 
+class _StreamedBody:
+    """A request body made of a few byte strings around one file, read in
+    blocks so a large file is never held in memory."""
+
+    def __init__(self, head: bytes, path: str, tail: bytes) -> None:
+        self._parts = [io.BytesIO(head), open(path, "rb"), io.BytesIO(tail)]
+        self.length = len(head) + os.path.getsize(path) + len(tail)
+
+    def read(self, size: int = -1) -> bytes:
+        out = b""
+        while self._parts and (size < 0 or len(out) < size):
+            chunk = self._parts[0].read(-1 if size < 0 else size - len(out))
+            if chunk:
+                out += chunk
+            else:
+                self._parts.pop(0).close()
+        return out
+
+    def close(self) -> None:
+        for part in self._parts:
+            part.close()
+        self._parts = []
+
+
 def _discord_request(
     url: str,
     method: str,
     form: Optional[dict] = None,
-    body: Optional[bytes] = None,
+    body=None,
     content_type: Optional[str] = None,
 ) -> tuple:
-    """Blocking request; returns (http_status, parsed_json). Status 0 = network error."""
+    """Blocking request; returns (http_status, parsed_json). Status 0 = network error.
+    `body` is bytes or a _StreamedBody."""
     headers = {"User-Agent": DISCORD_USER_AGENT}
     data = None
     if form is not None:
@@ -1121,14 +1671,19 @@ def _discord_request(
         data = body
         if content_type:
             headers["Content-Type"] = content_type
+        if isinstance(body, _StreamedBody):
+            headers["Content-Length"] = str(body.length)
     req = _new_request(url, data=data, method=method, headers=headers)
     try:
-        with _urlopen(req, 30) as resp:
+        with _urlopen(req, 30 if not isinstance(body, _StreamedBody) else 300) as resp:
             raw, status = resp.read(), resp.status
     except _http_error() as e:
         raw, status = e.read(), e.code
     except OSError as e:
         return 0, {"error": str(e)}
+    finally:
+        if isinstance(body, _StreamedBody):
+            body.close()
     try:
         return status, (json.loads(raw.decode("utf-8")) if raw else {})
     except ValueError:
@@ -1286,13 +1841,16 @@ def _discord_webhook_url() -> Optional[str]:
     return None
 
 
+DISCORD_MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+
+
 def _upload_file_to_discord(webhook_url: str, path: str, content: str) -> dict:
     """Blocking multipart upload through the webhook (message text + one attachment)."""
     filename = os.path.basename(path)
-    mime = "image/png" if os.path.splitext(path)[1].lower() == ".png" else "image/jpeg"
-    with open(path, "rb") as f:
-        file_bytes = f.read()
-
+    mime = _guess_mime(path)
+    # No Discord server accepts anything near this size; refuse before sending.
+    if os.path.getsize(path) > DISCORD_MAX_UPLOAD_BYTES:
+        return {"ok": False, "error": "too_large"}
     payload = json.dumps({
         "content": content,
         # Game names are arbitrary text; never let one ping @everyone or a role.
@@ -1300,15 +1858,14 @@ def _upload_file_to_discord(webhook_url: str, path: str, content: str) -> dict:
         "attachments": [{"id": 0, "filename": filename}],
     }).encode("utf-8")
     boundary = "omni_revi_transfer_" + secrets.token_hex(8)
-    body = (
+    head = (
         f"--{boundary}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\n"
         f"Content-Type: application/json\r\n\r\n".encode("utf-8")
         + payload
         + f"\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"{filename}\"\r\n"
         f"Content-Type: {mime}\r\n\r\n".encode("utf-8")
-        + file_bytes
-        + f"\r\n--{boundary}--\r\n".encode("utf-8")
     )
+    body = _StreamedBody(head, path, f"\r\n--{boundary}--\r\n".encode("utf-8"))
     status, result = _discord_request(
         webhook_url + "?wait=true", "POST", body=body, content_type=f"multipart/form-data; boundary={boundary}"
     )
@@ -1355,6 +1912,49 @@ async def _upload_screenshot_to_discord(real: str) -> dict:
     return result
 
 
+async def _upload_recording_to_drive(clip_dir: str) -> dict:
+    """`clip_dir` must already be validated with _is_inside_recordings."""
+    access_token = await _get_google_access_token()
+    if access_token is None:
+        return {"ok": False, "error": "not_linked"}
+    folder_id = await _get_drive_game_folder_id(access_token, _recording_appid(clip_dir), "recordings")
+    if folder_id:
+        already_there = await _run_blocking(
+            _drive_file_exists, access_token, os.path.basename(clip_dir) + ".mp4", folder_id
+        )
+        if already_there:
+            return {"ok": False, "error": "duplicate"}
+    mp4, error = await _run_blocking(_export_recording_blocking, clip_dir)
+    if mp4 is None:
+        return {"ok": False, "error": error}
+    try:
+        return await _run_blocking(_upload_file_to_drive, access_token, mp4, folder_id)
+    finally:
+        _remove_export(mp4)
+
+
+async def _upload_recording_to_discord(clip_dir: str) -> dict:
+    """`clip_dir` must already be validated with _is_inside_recordings."""
+    webhook_url = _discord_webhook_url()
+    if webhook_url is None:
+        return {"ok": False, "error": "not_linked"}
+    limit_mb = _load_settings()["export_discord_limit_mb"]
+    mp4, error = await _run_blocking(
+        _export_recording_blocking, clip_dir, limit_mb * 1024 * 1024 if limit_mb else None
+    )
+    if mp4 is None:
+        return {"ok": False, "error": error}
+    try:
+        result = await _run_blocking(
+            _upload_file_to_discord, webhook_url, mp4, f"**{_resolve_drive_folder_name(_recording_appid(clip_dir))}**"
+        )
+    finally:
+        _remove_export(mp4)
+    if result.get("error") == "not_linked":
+        _delete_file_quietly(DISCORD_TOKEN_PATH)
+    return result
+
+
 # --- Settings -----------------------------------------------------------------
 
 SETTINGS_PATH = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "config.json")
@@ -1366,11 +1966,15 @@ DEFAULT_SETTINGS = {
     # in the UI must warn about it clearly.
     "max_storage_mb": 2048,
     "auto_delete": False,
+    # The same two settings for recordings, which are far bigger than screenshots.
+    "max_recordings_mb": 10240,
+    "auto_delete_recordings": False,
     "qr_share_duration_seconds": SHARE_DEFAULT_DURATION_SECONDS,
-    # Opt-in, and only offered once the matching service is linked. Each new
-    # screenshot is uploaded automatically shortly after it's taken.
-    "auto_upload_google_drive": False,
-    "auto_upload_discord": False,
+    # Opt-in, and only offered once the matching service is linked. What each
+    # service uploads by itself: "off", "screenshots", "videos" (recordings)
+    # or "all". Steam only takes screenshots ("off" or "screenshots").
+    "auto_upload_mode_google_drive": "off",
+    "auto_upload_mode_discord": "off",
     # Seconds between taking a screenshot and its auto-upload, per service.
     "auto_upload_delay_google_drive": 10,
     "auto_upload_delay_discord": 10,
@@ -1378,8 +1982,15 @@ DEFAULT_SETTINGS = {
     # backend can't call it), but its preferences live here with the rest.
     # steam_upload_privacy uses Steam's EUCMFilePrivacyState values:
     # 2 private, 4 friends only, 8 public, 16 unlisted. Private is the safe default.
-    "auto_upload_steam": False,
+    "auto_upload_mode_steam": "off",
     "auto_upload_delay_steam": 10,
+    # Video export: how a recording becomes an mp4 (see _export_recording_blocking).
+    "export_quality": "original",  # "original" (copy, instant), "smaller" or "smallest" (re-encode)
+    "export_max_height": 0,  # 0 = as recorded; 720 or 480 shrinks the picture when re-encoding
+    "export_encoder": "software",  # "software" (x264) or "hardware" (VAAPI, falls back to software)
+    "export_crop_16_9": False,  # crop the Deck's 16:10 recordings to 16:9 (forces a re-encode)
+    "export_discord_limit_mb": 10,  # shrink a video to fit this size when sending to Discord; 0 = never
+    "export_game_folders": False,  # "Save MP4" puts each game's videos in its own folder under Videos
     "steam_upload_privacy": 2,
 }
 
@@ -1390,7 +2001,13 @@ def _load_settings() -> dict:
             saved = json.load(f)
     except (OSError, json.JSONDecodeError):
         saved = {}
-    return {**DEFAULT_SETTINGS, **saved}
+    settings = {**DEFAULT_SETTINGS, **saved}
+    # Before 0.1.0 each service had an on/off toggle, which meant screenshots.
+    for service in ("google_drive", "discord", "steam"):
+        old_toggle = settings.pop(f"auto_upload_{service}", None)
+        if f"auto_upload_mode_{service}" not in saved:
+            settings[f"auto_upload_mode_{service}"] = "screenshots" if old_toggle else "off"
+    return settings
 
 
 def _save_settings(settings: dict) -> None:
@@ -1417,21 +2034,40 @@ def _validate_settings(raw: dict) -> dict:
     auto_delete = bool(raw.get("auto_delete", DEFAULT_SETTINGS["auto_delete"]))
     if max_storage_mb == 0:
         auto_delete = False  # doesn't make sense with no limit; see _enforce_auto_delete's guard too
+    try:
+        max_recordings_mb = int(raw.get("max_recordings_mb", DEFAULT_SETTINGS["max_recordings_mb"]))
+    except (TypeError, ValueError):
+        max_recordings_mb = DEFAULT_SETTINGS["max_recordings_mb"]
+    if max_recordings_mb != 0:
+        max_recordings_mb = max(500, max_recordings_mb)  # a single clip can be hundreds of MB
+    auto_delete_recordings = bool(raw.get("auto_delete_recordings", DEFAULT_SETTINGS["auto_delete_recordings"]))
+    if max_recordings_mb == 0:
+        auto_delete_recordings = False
     return {
         "max_storage_mb": max_storage_mb,
         "auto_delete": auto_delete,
+        "max_recordings_mb": max_recordings_mb,
+        "auto_delete_recordings": auto_delete_recordings,
         "qr_share_duration_seconds": max(30, min(3600, qr_share_duration_seconds)),
-        "auto_upload_google_drive": bool(
-            raw.get("auto_upload_google_drive", DEFAULT_SETTINGS["auto_upload_google_drive"])
-        ),
-        "auto_upload_discord": bool(raw.get("auto_upload_discord", DEFAULT_SETTINGS["auto_upload_discord"])),
+        "auto_upload_mode_google_drive": _clean_auto_upload_mode(raw.get("auto_upload_mode_google_drive")),
+        "auto_upload_mode_discord": _clean_auto_upload_mode(raw.get("auto_upload_mode_discord")),
         "auto_upload_delay_google_drive": _clamp_auto_upload_delay(
             raw.get("auto_upload_delay_google_drive", DEFAULT_SETTINGS["auto_upload_delay_google_drive"])
         ),
         "auto_upload_delay_discord": _clamp_auto_upload_delay(
             raw.get("auto_upload_delay_discord", DEFAULT_SETTINGS["auto_upload_delay_discord"])
         ),
-        "auto_upload_steam": bool(raw.get("auto_upload_steam", DEFAULT_SETTINGS["auto_upload_steam"])),
+        "auto_upload_mode_steam": _clean_auto_upload_mode(raw.get("auto_upload_mode_steam"), steam=True),
+        "export_quality": raw.get("export_quality") if raw.get("export_quality") in _EXPORT_PROFILES else "original",
+        "export_max_height": raw.get("export_max_height") if raw.get("export_max_height") in (0, 720, 480) else 0,
+        "export_encoder": "hardware" if raw.get("export_encoder") == "hardware" else "software",
+        "export_crop_16_9": bool(raw.get("export_crop_16_9", DEFAULT_SETTINGS["export_crop_16_9"])),
+        "export_discord_limit_mb": (
+            raw.get("export_discord_limit_mb")
+            if raw.get("export_discord_limit_mb") in (0, 10, 25, 50, 100)
+            else DEFAULT_SETTINGS["export_discord_limit_mb"]
+        ),
+        "export_game_folders": bool(raw.get("export_game_folders", DEFAULT_SETTINGS["export_game_folders"])),
         "auto_upload_delay_steam": _clamp_auto_upload_delay(
             raw.get("auto_upload_delay_steam", DEFAULT_SETTINGS["auto_upload_delay_steam"])
         ),
@@ -1445,12 +2081,27 @@ def _validate_settings(raw: dict) -> dict:
 
 STEAM_UPLOAD_PRIVACY_VALUES = (2, 4, 8, 16)
 
+AUTO_UPLOAD_MODES = ("off", "screenshots", "videos", "all")
+
+
+def _clean_auto_upload_mode(value, steam: bool = False) -> str:
+    if value not in AUTO_UPLOAD_MODES:
+        return "off"
+    if steam and value != "off":
+        return "screenshots"  # Steam only takes screenshots
+    return value
+
+
+def _mode_includes(mode, kind: str) -> bool:
+    """kind is "screenshots" or "videos"."""
+    return mode == kind or mode == "all"
+
 
 def _disable_auto_upload(setting_key: str) -> None:
-    """Turns an auto-upload toggle off (used when its service is unlinked)."""
+    """Turns a service's auto-upload off (used when it is unlinked)."""
     settings = _load_settings()
-    if settings.get(setting_key):
-        settings[setting_key] = False
+    if settings.get(setting_key) != "off":
+        settings[setting_key] = "off"
         _save_settings(settings)
 
 
@@ -1470,10 +2121,10 @@ AUTO_UPLOAD_MIN_DELAY_SECONDS = 5
 AUTO_UPLOAD_MAX_DELAY_SECONDS = 60
 AUTO_UPLOAD_POLL_SECONDS = 2
 
-# (display name, toggle setting, delay setting)
+# (display name, mode setting, delay setting)
 _AUTO_UPLOAD_SERVICES = (
-    ("Google Drive", "auto_upload_google_drive", "auto_upload_delay_google_drive"),
-    ("Discord", "auto_upload_discord", "auto_upload_delay_discord"),
+    ("Google Drive", "auto_upload_mode_google_drive", "auto_upload_delay_google_drive"),
+    ("Discord", "auto_upload_mode_discord", "auto_upload_delay_discord"),
 )
 
 
@@ -1486,12 +2137,16 @@ def _clamp_auto_upload_delay(value) -> int:
 
 
 class _AutoUploader:
-    """Notices new screenshots for the Google Drive / Discord auto-upload.
+    """Notices new screenshots and new recordings for the Google Drive /
+    Discord auto-upload.
 
-    While neither toggle is on it does nothing but read the settings file:
-    no folder is scanned at all. Once one is on, each check asks the shared
-    screenshot index (which only re-reads folders that changed) for entries
-    newer than a watermark, so the cost doesn't depend on library size."""
+    While no service is set to upload a kind of file it does nothing but read
+    the settings file: nothing is scanned at all. Once one is, each check asks
+    the shared screenshot index (which only re-reads folders that changed) for
+    entries newer than a watermark, so the cost doesn't depend on library
+    size. Recordings are found by listing the clip folders (a handful of
+    names) and are only sent once Steam has finished writing them: the size
+    has stopped changing and the clip's session.mpd exists."""
 
     def __init__(self) -> None:
         self._task: Optional[asyncio.Task] = None
@@ -1499,14 +2154,23 @@ class _AutoUploader:
         # files newer than this count as "new": existing ones are never
         # uploaded, and neither are ones dropped in with an old timestamp.
         self._watermark: Optional[float] = None
+        # Same idea for recordings, using the clip folder's own timestamp.
+        self._rec_watermark: Optional[float] = None
         # path -> {"first_seen": monotonic time, "size": latest size,
         #          "prev_size": size at the previous check, "done": services handled}
         self._pending: dict = {}
+        self._rec_pending: dict = {}
+        self._last_storage_check = 0.0
+        self._newest_clip: Optional[str] = None
+        self._newest_clip_known = False
 
     async def start(self) -> None:
         await self.stop()
+        self._newest_clip, self._newest_clip_known = None, False
         self._watermark = None
+        self._rec_watermark = None
         self._pending = {}
+        self._rec_pending = {}
         self._task = asyncio.get_event_loop().create_task(self._run())
 
     async def stop(self) -> None:
@@ -1526,13 +2190,31 @@ class _AutoUploader:
 
     async def _tick(self) -> None:
         settings = _load_settings()
-        active = any(settings.get(toggle_key) for _, toggle_key, _ in _AUTO_UPLOAD_SERVICES)
+        now = time.monotonic()
+        await self._tick_screenshots(settings, now)
+        await self._tick_recordings(settings, now)
+        # Recordings are big, so their limit is watched on its own (a clip can
+        # be saved at any time) instead of only when the menu is opened.
+        if settings.get("max_recordings_mb") and now - self._last_storage_check >= 10:
+            self._last_storage_check = now
+            await _enforce_recordings_auto_delete(settings)
+            clips = await _run_blocking(_list_recordings)
+            newest = clips[0][0] if clips else None
+            new_clip = self._newest_clip_known and newest is not None and newest != self._newest_clip
+            self._newest_clip, self._newest_clip_known = newest, True
+            await _check_storage_alerts("recordings", new_item=new_clip)
+
+    @staticmethod
+    def _wanted(settings: dict, kind: str) -> bool:
+        return any(_mode_includes(settings.get(mode_key), kind) for _, mode_key, _ in _AUTO_UPLOAD_SERVICES)
+
+    async def _tick_screenshots(self, settings: dict, now: float) -> None:
+        active = self._wanted(settings, "screenshots")
         if not active and not self._pending:
-            # Idle: scan nothing. A fresh baseline is taken when a toggle is switched on.
+            # Idle: scan nothing. A fresh baseline is taken when a mode is switched on.
             self._watermark = None
             return
 
-        now = time.monotonic()
         if active:
             entries, _ = await _run_blocking(_screenshot_index.snapshot)
             if self._watermark is None:
@@ -1549,17 +2231,63 @@ class _AutoUploader:
                         }
                 self._watermark = newest
 
-        for path in list(self._pending):
-            entry = self._pending[path]
+        await self._process(self._pending, "screenshots", settings, now, os.path.getsize)
+
+    async def _tick_recordings(self, settings: dict, now: float) -> None:
+        active = self._wanted(settings, "videos")
+        if not active and not self._rec_pending:
+            self._rec_watermark = None
+            return
+
+        if active:
+            clips = await _run_blocking(_list_recordings)
+            if self._rec_watermark is None:
+                # Baseline: clips saved before this moment are never uploaded.
+                mtimes = []
+                for path, _ in clips:
+                    try:
+                        mtimes.append(os.path.getmtime(path))
+                    except OSError:
+                        pass
+                self._rec_watermark = max(mtimes) if mtimes else time.time()
+            else:
+                newest = self._rec_watermark
+                for path, _ in clips:
+                    try:
+                        modified = os.path.getmtime(path)
+                    except OSError:
+                        continue
+                    if modified <= self._rec_watermark:
+                        continue
+                    newest = max(newest, modified)
+                    if path not in self._rec_pending:
+                        self._rec_pending[path] = {"first_seen": now, "size": None, "prev_size": None, "done": set()}
+                self._rec_watermark = newest
+
+        await self._process(self._rec_pending, "videos", settings, now, self._clip_size_if_ready)
+
+    @staticmethod
+    def _clip_size_if_ready(path: str) -> int:
+        """Size of a clip folder, or -1 while its session.mpd is not there yet
+        (so the clip counts as still being written)."""
+        if not os.path.isdir(path):
+            raise OSError("clip is gone")
+        if _recording_mpd(path) is None:
+            return -1
+        return _recording_size(path)
+
+    async def _process(self, pending: dict, kind: str, settings: dict, now: float, size_of) -> None:
+        for path in list(pending):
+            entry = pending[path]
             try:
-                size = os.path.getsize(path)
+                size = await _run_blocking(size_of, path)
             except OSError:
-                del self._pending[path]  # deleted (by the user or storage auto-delete) before its turn
+                del pending[path]  # deleted (by the user or storage auto-delete) before its turn
                 continue
             entry["prev_size"], entry["size"] = entry["size"], size
-            still_being_written = entry["size"] != entry["prev_size"]
+            still_being_written = size < 0 or entry["size"] != entry["prev_size"]
 
-            for service, toggle_key, delay_key in _AUTO_UPLOAD_SERVICES:
+            for service, mode_key, delay_key in _AUTO_UPLOAD_SERVICES:
                 if service in entry["done"]:
                     continue
                 if now - entry["first_seen"] < _clamp_auto_upload_delay(settings.get(delay_key)):
@@ -1567,24 +2295,27 @@ class _AutoUploader:
                 if still_being_written:
                     continue
                 entry["done"].add(service)  # decided now: uploaded, or skipped because it's off
-                if settings.get(toggle_key):
-                    await self._upload(service, path)
+                if _mode_includes(settings.get(mode_key), kind):
+                    await self._upload(service, kind, path)
 
             if len(entry["done"]) == len(_AUTO_UPLOAD_SERVICES):
-                del self._pending[path]
+                del pending[path]
 
-    async def _upload(self, service: str, path: str) -> None:
-        real = _is_inside_steam_screenshots(path)
+    async def _upload(self, service: str, kind: str, path: str) -> None:
+        if kind == "screenshots":
+            real = _is_inside_steam_screenshots(path)
+        else:
+            real = _is_inside_recordings(path)
         if real is None:
             return
         if service == "Google Drive":
             if not (GOOGLE_DRIVE_ENABLED and _load_google_token() is not None):
                 return
-            upload = _upload_screenshot_to_drive
+            upload = _upload_screenshot_to_drive if kind == "screenshots" else _upload_recording_to_drive
         else:
             if not (DISCORD_ENABLED and _discord_webhook_url() is not None):
                 return
-            upload = _upload_screenshot_to_discord
+            upload = _upload_screenshot_to_discord if kind == "screenshots" else _upload_recording_to_discord
 
         filename = os.path.basename(real)
         result = await upload(real)
@@ -1647,13 +2378,75 @@ class Plugin:
         # manager would.
         return _delete_screenshot_files(real)
 
+    async def screenshot_taken(self) -> None:
+        """Called by the frontend when Steam reports a new screenshot: applies
+        the storage limit right away and repeats the over-the-limit alert."""
+        await _enforce_auto_delete(_load_settings())
+        await _check_storage_alerts("screenshots", new_item=True)
+
+    async def get_recordings(self, offset: int = 0, limit: int = 5) -> dict:
+        """Paginates Steam's game recordings (saved clips), newest first."""
+        offset = max(0, offset)
+        limit = max(1, limit)
+
+        await _enforce_recordings_auto_delete(_load_settings())
+        await _check_storage_alerts("recordings")
+        clips = await _run_blocking(_list_recordings)
+        items = []
+        for clip_dir, appid in clips[offset:offset + limit]:
+            try:
+                thumbnail = _file_to_data_uri(os.path.join(clip_dir, "thumbnail.jpg"))
+            except OSError:
+                thumbnail = ""
+            items.append({
+                "filename": os.path.basename(clip_dir),
+                "path": clip_dir,
+                "appName": _resolve_app_name(appid),
+                "modified": os.path.getmtime(clip_dir),
+                "thumbnail": thumbnail,
+                "durationSeconds": _recording_duration(clip_dir),
+                "sizeBytes": _recording_size(clip_dir),
+            })
+        return {"total": len(clips), "offset": offset, "limit": limit, "items": items}
+
+    async def delete_recording(self, path: str) -> bool:
+        real = _is_inside_recordings(path)
+        if real is None:
+            decky.logger.warning(f"Attempted to delete outside of Steam's recordings: {path}")
+            return False
+        return _delete_recording(real)
+
+    async def save_recording_mp4(self, path: str) -> dict:
+        """Exports a recording to a file in the user's Videos folder."""
+        real = _is_inside_recordings(path)
+        if real is None:
+            return {"ok": False, "path": None, "error": "invalid_path"}
+        saved, error = await _run_blocking(_save_recording_blocking, real)
+        return {"ok": saved is not None, "path": saved, "error": error}
+
+    async def upload_recording_to_drive(self, path: str) -> dict:
+        real = _is_inside_recordings(path)
+        if real is None:
+            return {"ok": False, "error": "invalid_path"}
+        if not GOOGLE_DRIVE_ENABLED:
+            return {"ok": False, "error": "not_linked"}
+        return await _upload_recording_to_drive(real)
+
+    async def upload_recording_to_discord(self, path: str) -> dict:
+        real = _is_inside_recordings(path)
+        if real is None:
+            return {"ok": False, "error": "invalid_path"}
+        if not DISCORD_ENABLED:
+            return {"ok": False, "error": "not_linked"}
+        return await _upload_recording_to_discord(real)
+
     async def get_steam_auto_upload_config(self) -> dict:
         """Just the Steam auto-upload preferences. The full get_settings() also
         checks storage and alerts, which is more than the frontend needs each
         time a screenshot is taken."""
         settings = _load_settings()
         return {
-            "auto_upload_steam": bool(settings.get("auto_upload_steam")),
+            "auto_upload_steam": _mode_includes(settings.get("auto_upload_mode_steam"), "screenshots"),
             "auto_upload_delay_steam": _clamp_auto_upload_delay(settings.get("auto_upload_delay_steam")),
             "steam_upload_privacy": (
                 settings["steam_upload_privacy"]
@@ -1665,38 +2458,61 @@ class Plugin:
     async def get_settings(self) -> dict:
         settings = _load_settings()
         await _enforce_auto_delete(settings)
+        await _enforce_recordings_auto_delete(settings)
         await _check_storage_alerts()
+        await _check_storage_alerts("recordings")
         settings = _load_settings()  # re-read: the calls above may have updated it
         used_mb = round(_total_storage_bytes() / (1024 * 1024), 1)
         settings["used_mb"] = used_mb
         settings["over_limit"] = settings["max_storage_mb"] != 0 and used_mb > settings["max_storage_mb"]
+        used_recordings_mb = round(await _run_blocking(_recordings_total_bytes) / (1024 * 1024), 1)
+        settings["used_recordings_mb"] = used_recordings_mb
+        settings["over_limit_recordings"] = (
+            settings["max_recordings_mb"] != 0 and used_recordings_mb > settings["max_recordings_mb"]
+        )
         settings["account_detected"] = _detect_steam_account_id() is not None
+        settings["ffmpeg_available"] = _ffmpeg_path() is not None
+        settings["hardware_encoder_available"] = os.path.exists(_VAAPI_DEVICE)
         return settings
 
     async def set_settings(self, new_settings: dict) -> dict:
         validated = _validate_settings(new_settings)
-        # An auto-upload toggle can't be on for a service that isn't linked.
+        # Auto-upload can't be on for a service that isn't linked.
         if _load_google_token() is None:
-            validated["auto_upload_google_drive"] = False
+            validated["auto_upload_mode_google_drive"] = "off"
         if _discord_webhook_url() is None:
-            validated["auto_upload_discord"] = False
+            validated["auto_upload_mode_discord"] = "off"
         # Preserve internal bookkeeping (e.g. which storage alert threshold
         # was last fired) that isn't part of the user-editable settings the
         # frontend sends, so saving a setting doesn't wipe it and cause a
         # threshold to re-alert needlessly.
         existing = _load_settings()
-        if "_last_storage_alert" in existing:
-            validated["_last_storage_alert"] = existing["_last_storage_alert"]
+        for memory_key in ("_last_storage_alert", "_last_recordings_alert"):
+            if memory_key in existing:
+                validated[memory_key] = existing[memory_key]
         _save_settings(validated)
         return await self.get_settings()
 
     async def start_qr_share(self, path: str, duration_seconds: int = SHARE_DEFAULT_DURATION_SECONDS) -> dict:
-        """Starts a local HTTP server serving only that file. Returns the LAN URL."""
+        """Starts a local HTTP server serving only that file (a screenshot, or a
+        recording exported to an mp4). Returns the LAN URL."""
+        duration_seconds = max(30, min(3600, int(duration_seconds)))
+        clip = _is_inside_recordings(path)
+        if clip is not None:
+            mp4, error = await _run_blocking(_export_recording_blocking, clip)
+            if mp4 is None:
+                return {"url": None, "error": error}
+            url = await _share_server.start(
+                mp4, duration_seconds, move=True, download_name=os.path.basename(mp4)
+            )
+            if url is None:
+                _remove_export(mp4)
+                return {"url": None, "error": "server_failed"}
+            return {"url": url, "error": None}
         real = _is_inside_steam_screenshots(path)
         if real is None or not os.path.isfile(real):
             decky.logger.warning(f"Invalid path when sharing: {path}")
             return {"url": None, "error": "invalid_path"}
-        duration_seconds = max(30, min(3600, int(duration_seconds)))
         url = await _share_server.start(real, duration_seconds)
         if url is None:
             return {"url": None, "error": "server_failed"}
@@ -1822,7 +2638,7 @@ class Plugin:
         if token_data:
             await _run_blocking(_http_post_form, GOOGLE_REVOKE_URL, {"token": token_data["refresh_token"]})
         _delete_google_token()
-        _disable_auto_upload("auto_upload_google_drive")
+        _disable_auto_upload("auto_upload_mode_google_drive")
 
     async def upload_screenshot_to_drive(self, path: str) -> dict:
         if not GOOGLE_DRIVE_ENABLED:
@@ -1891,7 +2707,7 @@ class Plugin:
             # failure (e.g. already deleted) is fine, the local copy goes anyway.
             await _run_blocking(_discord_request, url, "DELETE")
         _delete_file_quietly(DISCORD_TOKEN_PATH)
-        _disable_auto_upload("auto_upload_discord")
+        _disable_auto_upload("auto_upload_mode_discord")
 
     async def upload_screenshot_to_discord(self, path: str) -> dict:
         if not DISCORD_ENABLED:
@@ -1917,10 +2733,12 @@ class Plugin:
             decky.logger.warning("Could not detect the Steam account under userdata/.")
         else:
             decky.logger.info(f"Steam account detected: {account_id}")
+        shutil.rmtree(RECORDING_EXPORT_DIR, ignore_errors=True)  # leftovers of an interrupted export
         await _auto_uploader.start()
 
     async def _unload(self) -> None:
         await _auto_uploader.stop()
+        shutil.rmtree(RECORDING_EXPORT_DIR, ignore_errors=True)
         await _share_server.stop()
         await _discord_link_server.stop()
         decky.logger.info("Omni-Revi-Transfer stopped.")
