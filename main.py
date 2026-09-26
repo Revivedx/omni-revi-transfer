@@ -710,6 +710,23 @@ def _fit_bitrate_kbps(limit_bytes: int, duration: Optional[float]) -> Optional[i
     return kbps if kbps >= 150 else None
 
 
+_ffmpeg_option_cache: dict = {}
+
+
+def _ffmpeg_supports(ffmpeg: str, option: str) -> bool:
+    """Whether this ffmpeg build knows an option (asked once, then remembered)."""
+    key = (ffmpeg, option)
+    if key not in _ffmpeg_option_cache:
+        try:
+            help_text = subprocess.run(
+                [ffmpeg, "-hide_banner", "-h", "long"], capture_output=True, timeout=15, env=_clean_subprocess_env()
+            ).stdout.decode("utf-8", errors="ignore")
+            _ffmpeg_option_cache[key] = option in help_text
+        except (OSError, subprocess.TimeoutExpired):
+            _ffmpeg_option_cache[key] = False
+    return _ffmpeg_option_cache[key]
+
+
 def _ffmpeg_command(
     ffmpeg: str, mpd: str, out_path: str, encode: bool, hardware: bool, quality: str,
     filters: list, bitrate_kbps: Optional[int],
@@ -734,19 +751,80 @@ def _ffmpeg_command(
             ["-b:v", f"{bitrate_kbps}k", "-maxrate", f"{bitrate_kbps}k", "-bufsize", f"{bitrate_kbps * 2}k"]
             if bitrate_kbps else ["-crf", crf]
         )
+    # Keep every frame at the moment it was recorded. Left alone, the encoder
+    # rounds the times to a fixed 1/60 s grid, which makes a game running at an
+    # uneven ~30 fps look choppier than it was.
+    if _ffmpeg_supports(ffmpeg, "-enc_time_base"):
+        cmd += ["-enc_time_base", "demux"]
     cmd += ["-c:a", "copy", "-movflags", "+faststart", out_path]
     nice = shutil.which("nice")
     return ([nice, "-n", "19"] if nice else []) + cmd
 
 
-def _run_ffmpeg(cmd: list, timeout: int) -> bool:
+# An export is stopped, rather than left to run, when ffmpeg alone passes this much
+# memory or the whole machine drops below the free-memory floor. A 4K recording
+# on a desktop once ran a machine out of memory during a re-encode; whatever
+# the cause, a share must never be able to take the computer down.
+_EXPORT_MEMORY_LIMIT_MB = 1536
+_EXPORT_MEMORY_FLOOR_MB = 1024
+_EXPORT_WATCH_SECONDS = 0.5
+
+
+def _process_rss_mb(pid: int) -> Optional[float]:
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=timeout, env=_clean_subprocess_env())
-    except (OSError, subprocess.TimeoutExpired) as e:
+        with open(f"/proc/{pid}/statm", "r") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1048576
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _available_memory_mb() -> Optional[float]:
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+class _ExportTooHeavy(Exception):
+    """ffmpeg was stopped for using too much memory."""
+
+
+def _run_ffmpeg(cmd: list, timeout: int) -> bool:
+    """Runs ffmpeg and returns whether it succeeded. Raises _ExportTooHeavy after
+    stopping it when it uses too much memory."""
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=_clean_subprocess_env()
+        )
+    except OSError as e:
         decky.logger.warning(f"ffmpeg failed to run: {e!r}")
         return False
-    if result.returncode != 0:
-        decky.logger.warning(f"ffmpeg export failed ({result.returncode}): {result.stderr.decode('utf-8', errors='ignore')[-300:]}")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            _, stderr = proc.communicate(timeout=_EXPORT_WATCH_SECONDS)
+            break
+        except subprocess.TimeoutExpired:
+            rss = _process_rss_mb(proc.pid)
+            free = _available_memory_mb()
+            too_big = rss is not None and rss > _EXPORT_MEMORY_LIMIT_MB
+            too_low = free is not None and free < _EXPORT_MEMORY_FLOOR_MB
+            if too_big or too_low or time.monotonic() > deadline:
+                proc.kill()
+                proc.communicate()
+                if time.monotonic() > deadline and not (too_big or too_low):
+                    decky.logger.warning("ffmpeg took too long and was stopped.")
+                    return False
+                decky.logger.warning(
+                    f"ffmpeg stopped for using too much memory (ffmpeg {rss and round(rss)} MB, machine has {free and round(free)} MB free)."
+                )
+                raise _ExportTooHeavy()
+    if proc.returncode != 0:
+        decky.logger.warning(f"ffmpeg export failed ({proc.returncode}): {stderr.decode('utf-8', errors='ignore')[-300:]}")
         return False
     return True
 
@@ -756,8 +834,8 @@ def _export_recording_blocking(clip_dir: str, fit_bytes: Optional[int] = None) -
     following the Video export settings. With `fit_bytes` (Discord's limit) the
     result is re-encoded to fit under that size if it would be bigger.
     Returns (mp4 path, None) or (None, error) where error is "no_video",
-    "no_ffmpeg", "no_space", "too_large" (the clip is too long to fit the limit)
-    or "export_failed". The caller must delete the mp4's folder (_remove_export)."""
+    "no_ffmpeg", "no_space", "too_large" (the clip is too long to fit the limit),
+    "too_heavy" (ffmpeg was stopped for using too much memory) or "export_failed". The caller must delete the mp4's folder (_remove_export)."""
     mpd = _recording_mpd(clip_dir)
     if mpd is None:
         return None, "no_video"
@@ -787,7 +865,8 @@ def _export_recording_blocking(clip_dir: str, fit_bytes: Optional[int] = None) -
     encode_timeout = int(max(600, min(3600, (duration or 300) * 8)))
 
     def attempt(do_encode: bool, do_filters: list, bitrate: Optional[int]) -> bool:
-        # Hardware first when asked for; any failure falls back to software.
+        # Hardware first when asked for; any failure falls back to software
+        # (except running out of memory, which software would only repeat).
         for use_hardware in ([True, False] if (do_encode and hardware) else [False]):
             if os.path.exists(out_path):
                 os.remove(out_path)
@@ -800,23 +879,26 @@ def _export_recording_blocking(clip_dir: str, fit_bytes: Optional[int] = None) -
         shutil.rmtree(out_dir, ignore_errors=True)
         return None, error
 
-    # A plain copy of a clip that is already over the limit cannot fit: skip straight to shrinking it.
-    needs_fit = bool(fit_bytes) and not encode and source_size > fit_bytes
-    if not needs_fit:
-        if not attempt(encode, filters, None):
-            return fail("export_failed")
-        needs_fit = bool(fit_bytes) and os.path.getsize(out_path) > fit_bytes
-    if needs_fit:
-        kbps = _fit_bitrate_kbps(fit_bytes, duration)
-        if kbps is None:
-            return fail("too_large")
-        # A low bitrate looks better on a smaller picture than a blocky big one.
-        fit_max_height = 480 if kbps < 1000 else max_height
-        fit_filters, _, _ = _video_filters(width, height, settings["export_crop_16_9"], fit_max_height)
-        if not attempt(True, fit_filters, kbps):
-            return fail("export_failed")
-        if os.path.getsize(out_path) > fit_bytes:
-            return fail("too_large")
+    try:
+        # A plain copy of a clip that is already over the limit cannot fit: skip straight to shrinking it.
+        needs_fit = bool(fit_bytes) and not encode and source_size > fit_bytes
+        if not needs_fit:
+            if not attempt(encode, filters, None):
+                return fail("export_failed")
+            needs_fit = bool(fit_bytes) and os.path.getsize(out_path) > fit_bytes
+        if needs_fit:
+            kbps = _fit_bitrate_kbps(fit_bytes, duration)
+            if kbps is None:
+                return fail("too_large")
+            # A low bitrate looks better on a smaller picture than a blocky big one.
+            fit_max_height = 480 if kbps < 1000 else max_height
+            fit_filters, _, _ = _video_filters(width, height, settings["export_crop_16_9"], fit_max_height)
+            if not attempt(True, fit_filters, kbps):
+                return fail("export_failed")
+            if os.path.getsize(out_path) > fit_bytes:
+                return fail("too_large")
+    except _ExportTooHeavy:
+        return fail("too_heavy")
     return out_path, None
 
 

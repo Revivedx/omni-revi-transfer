@@ -41,6 +41,7 @@ __pycache__/
 yalc.lock
 
 .vscode/settings.json
+/settings.*.json
 
 # Steam Deck deploy credentials (deckIP/deckUser/deckPass)
 /settings.json

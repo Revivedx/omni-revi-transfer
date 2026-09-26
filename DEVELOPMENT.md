@@ -18,6 +18,7 @@ How to build, test on a Deck and publish a release. If you just want to use the 
 |---|---|
 | `npm run deploy` | Builds, stops `plugin_loader` on the Deck, uploads the plugin over SFTP and restarts it. (Stopping first avoids a hot-reload race that can leave a runaway plugin process; see `scripts/deploy.mjs`.) |
 | `npm run deploy -- --no-credentials` | Deploys like a fresh public install, to test the in-plugin "Set up" flow. |
+| `npm run deploy -- --device NAME` | Deploys to another machine (another Deck, or a PC with Decky Loader) described in `settings.NAME.json`, same fields as `settings.json`; it is gitignored (`/settings.*.json`). Add `--no-credentials` to keep your keys off that machine. |
 | `npm run build` / `npm run watch` | Compile only. |
 | `npm run package` | Builds the **public** zip `release/omni-revi-transfer-vX.Y.Z.zip` (no credentials) and copies the installer files next to it. |
 | `npm run package:personal` | Builds `...-personal.zip` with your credentials for your own devices. **Never publish it.** It refuses to build if a credentials file is missing. |
@@ -50,6 +51,14 @@ To run the plugin on your own devices (another Deck, or another Linux PC with De
 | `typescript` | Type checking |
 | `node-ssh` | Powers `scripts/deploy.mjs`, our own SSH/SFTP deploy script (see Commands above) |
 | `archiver` | Powers `scripts/package.mjs`, builds the distributable install zip |
+
+## Ideas for later (1.1)
+
+Not planned for a hotfix; noted from testing on a Bazzite desktop PC (RX 7900 XT).
+
+- **Codec choice for the hardware encoder.** Video export uses `h264_vaapi` only. The 7900 XT also encodes H.265 and AV1 in hardware (`hevc_vaapi`, `av1_vaapi`: all three passed a real 4K test encode), which give smaller files at the same quality. The plugin could detect what the machine supports with a one-frame test encode per codec (cached; `ffmpeg -encoders` only says what the build contains, not what the GPU does) and offer a **Codec** dropdown next to Encoder, showing only what works. Keep H.264 as the default: H.265 and AV1 often do not preview in browsers or in Discord. Only with the hardware encoder, since x265 and AV1 in software would be far too slow on a Deck. The Steam Deck's own support for H.265 and AV1 encoding still has to be checked with the same test.
+- **Pick the right video device.** The hardware encoder always uses `/dev/dri/renderD128`. A PC with an integrated GPU plus a dedicated one may have the dedicated card on another `renderD*`; try each one with the same test encode and use the first that works.
+- A progress indicator and a cancel button for long re-encodes (software at 4K takes minutes).
 
 ## Publishing a release
 

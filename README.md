@@ -2,7 +2,14 @@
 
 **What the plugin does:** Omni-Revi-Transfer is a plugin for the Steam Deck (installed through [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader)) that lets you browse, manage and share the screenshots and game recordings your Deck already makes, right from the in-game Quick Access Menu: send them to your phone with a QR code, to your Steam account or a Steam friend, to a Discord channel, or to your own Google Drive, without ever leaving your controller.
 
-## Latest update — v1.0.0
+## Latest update — v1.0.1
+
+- **Desktop fix**: on a PC, choosing an option in a dropdown no longer closes the open panel or shows the old value.
+- **Re-encoded videos keep the game's real frame timing**, so they look as smooth as the recording.
+- **Safety net for video export**: it is stopped if it would use too much memory, instead of risking the whole computer.
+- Also tested on a desktop PC running Bazzite with Decky Loader, not only on the Deck.
+
+Version 1.0.0 (previous update):
 
 - **Recordings**: the clips saved with Steam's game recording get their own list, with the same **Share** (QR, Google Drive, Discord) and **Delete** as screenshots, plus **Save MP4 to Videos**.
 - **Video export**: choose how a recording becomes an MP4, from an instant copy to a much smaller re-encode, and let Discord videos shrink to fit the server's size limit.

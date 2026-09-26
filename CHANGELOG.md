@@ -2,6 +2,22 @@
 
 All notable changes to Omni-Revi-Transfer are documented in this file. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.0.1] - 2026-09-25
+
+A hotfix found while testing on a desktop PC running Bazzite (Decky Loader, RX 7900 XT, 4K recordings) in addition to the Steam Deck.
+
+### Fixed
+- **Panels closed and options looked unapplied on a desktop.** In Steam's windowed Big Picture, opening a dropdown hides the Quick Access Menu for a moment and it comes back rebuilt. That closed the open panel (Video export, Share options, Storage and the lists), and the panel that came back showed the old value even though the new one had been saved, so the choice had to be made twice. Open panels are now remembered, and all panels share one copy of the settings. That also stops a panel that had been open a while from saving old values over changes made in another panel.
+- **Re-encoded videos looked choppier than the recording.** The encoder rounded every frame's time to a fixed 1/60 s grid, which adds judder to a game running at an uneven ~30 fps. A re-encode now keeps each frame at the moment it was recorded (`-enc_time_base demux`), so the exported video has the same frame timing as the original. Checked on a 4K clip with the hardware encoder, the Discord size fit and the software encoder. The option is only used if the installed `ffmpeg` knows it.
+
+### Added
+- **Memory guard for video export.** If `ffmpeg` uses more than 1.5 GB, or the computer has less than 1 GB of memory free, the export is stopped and a message says the recording is too heavy to prepare (with a hint to use Original quality or a lower resolution). It is not retried in software, which would use the same memory. It never triggered in testing (the peak was under 1.3 GB even for 4K); it is there so a share can never run a machine out of memory.
+- For developers: `npm run deploy -- --device NAME` deploys to another machine described in a gitignored `settings.NAME.json`, and the local performance tools accept `OMNI_DEVICE=NAME`.
+
+### Notes
+- A report of a crash while recording at 4K on that PC could not be reproduced: a 4K clip recorded by Steam exports with the hardware encoder in about 11 s and never above ~560 MB of memory for `ffmpeg`, and synthetic 4K clips in H.264, HEVC, HEVC 10-bit and AV1 behave the same. The recording itself is done by Steam, not by the plugin.
+- Re-encoding in software at 4K is slow (about 124 s for a 36 s clip); the hardware encoder takes about 11 s.
+
 ## [1.0.0] - 2026-09-20
 
 The plugin now covers everything it was meant to. From here on, releases are hotfixes.

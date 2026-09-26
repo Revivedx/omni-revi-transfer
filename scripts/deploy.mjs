@@ -17,7 +17,11 @@ function loadJSON(relPath) {
   return JSON.parse(readFileSync(path.join(rootDir, relPath), "utf-8"));
 }
 
-const settings = loadJSON("settings.json");
+// `--device NAME` deploys to another machine listed in settings.NAME.json (same fields as
+// settings.json, gitignored), e.g. `npm run deploy -- --device bazzite`.
+const deviceIndex = process.argv.indexOf("--device");
+const device = deviceIndex > -1 ? process.argv[deviceIndex + 1] : null;
+const settings = loadJSON(device ? `settings.${device}.json` : "settings.json");
 const pluginMeta = loadJSON("plugin.json");
 
 const {

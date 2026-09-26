@@ -37,7 +37,7 @@ interface ScreenshotItem {
 }
 
 // Why a recording could not be turned into a single .mp4 for sharing.
-type ExportError = "no_video" | "no_ffmpeg" | "no_space" | "export_failed";
+type ExportError = "no_video" | "no_ffmpeg" | "no_space" | "too_heavy" | "export_failed";
 
 // Video export settings (Settings -> Video export); see main.py.
 type ExportQuality = "original" | "smaller" | "smallest";
@@ -412,6 +412,27 @@ async function shareToSteamFriend(item: ScreenshotItem, friend: SteamFriend, onC
 
 const PAGE_SIZE = 5;
 
+// Which panels are open. Steam can rebuild the plugin's menu while it stays
+// loaded (on a desktop, opening a dropdown hides the Quick Access Menu for a
+// moment, and it comes back rebuilt), which would close every open panel and
+// lose the user's place. Keeping this outside the components survives that.
+const openPanels: Record<string, boolean> = {};
+
+function useOpenPanel(key: string): [boolean, (open: boolean | ((current: boolean) => boolean)) => void] {
+  const [open, setOpen] = useState<boolean>(() => openPanels[key] ?? false);
+  const set = useCallback(
+    (next: boolean | ((current: boolean) => boolean)) => {
+      setOpen((current) => {
+        const value = typeof next === "function" ? next(current) : next;
+        openPanels[key] = value;
+        return value;
+      });
+    },
+    [key]
+  );
+  return [open, set];
+}
+
 const isRecording = (item: ScreenshotItem) => item.kind === "recording";
 
 function exportErrorText(error: string | null | undefined): string | undefined {
@@ -420,6 +441,8 @@ function exportErrorText(error: string | null | undefined): string | undefined {
       return "ffmpeg wasn't found on this Deck, so the recording can't be prepared.";
     case "no_space":
       return "Not enough free space to prepare the recording.";
+    case "too_heavy":
+      return "This recording is too heavy to prepare here: it would have run the Deck out of memory, so it was stopped. Try Original quality, or a lower resolution in Video export.";
     case "no_video":
       return "Steam hasn't finished saving this recording yet.";
     case "export_failed":
@@ -1348,7 +1371,7 @@ function GalleryRow({ item, onOpen }: { item: ScreenshotItem; onOpen: () => void
 function MediaSection({ kind }: { kind: "screenshot" | "recording" }) {
   const recording = kind === "recording";
   const title = recording ? "Recordings" : "Screenshots";
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useOpenPanel(recording ? "recordings" : "screenshots");
   const [offset, setOffset] = useState(0);
   const [page, setPage] = useState<ScreenshotPage | undefined>();
   const [loading, setLoading] = useState(false);
@@ -1446,34 +1469,63 @@ function MediaSection({ kind }: { kind: "screenshot" | "recording" }) {
 
 const SETTINGS_SAVE_DELAY_MS = 400;
 
-// The UI updates instantly, but the backend is only told once the user pauses.
-// Saving on every step of a slider drag made the backend run a full settings
-// save (plus its storage checks) for each tick of the drag.
-function useSettingsUpdater(settings: Settings | undefined, setLocalSettings: (settings: Settings) => void) {
-  const latest = useRef<Settings | undefined>(settings);
-  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  // While a save is pending, `latest` holds the newest local edit; don't let a re-render overwrite it.
-  if (!timer.current) latest.current = settings;
+// One copy of the settings shared by every panel, outside the components.
+// Two things depend on that:
+// - Each panel used to keep its own copy and save all of it, so a panel that
+//   had been open a while could write old values of the other panels back.
+// - On a desktop, opening a dropdown hides the Quick Access Menu and it comes
+//   back rebuilt; a choice made in the old panel has to show up in the new one.
+// The UI updates instantly, but the backend is only told once the user pauses:
+// saving on every step of a slider drag made it run a full save (plus its
+// storage checks) for each tick.
+let sharedSettings: Settings | undefined;
+let saveTimer: ReturnType<typeof setTimeout> | undefined;
+const settingsListeners = new Set<(settings: Settings) => void>();
 
-  return useCallback(
-    (patch: Partial<Settings>) => {
-      if (!latest.current) return;
-      const next = { ...latest.current, ...patch };
-      latest.current = next;
-      setLocalSettings(next);
-      if (timer.current) clearTimeout(timer.current);
-      timer.current = setTimeout(async () => {
-        timer.current = undefined;
-        const saved = await setSettings(next);
-        // Adopt the backend's answer only if nothing was changed while saving.
-        if (!timer.current) {
-          latest.current = saved;
-          setLocalSettings(saved);
-        }
-      }, SETTINGS_SAVE_DELAY_MS);
-    },
-    [setLocalSettings]
-  );
+function publishSettings(next: Settings) {
+  sharedSettings = next;
+  settingsListeners.forEach((listener) => listener(next));
+}
+
+let refreshing: Promise<void> | undefined;
+
+// Panels mounting at the same moment share one request.
+function refreshSharedSettings(): Promise<void> {
+  if (!refreshing) {
+    refreshing = getSettings()
+      .then((fresh) => {
+        if (!saveTimer) publishSettings(fresh); // an edit still waiting to be saved is newer than the backend's copy
+      })
+      .finally(() => {
+        refreshing = undefined;
+      });
+  }
+  return refreshing;
+}
+
+function updateSharedSettings(patch: Partial<Settings>) {
+  if (!sharedSettings) return;
+  publishSettings({ ...sharedSettings, ...patch });
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    saveTimer = undefined;
+    const saved = await setSettings(sharedSettings as Settings);
+    // Adopt the backend's answer only if nothing was changed while saving.
+    if (!saveTimer) publishSettings(saved);
+  }, SETTINGS_SAVE_DELAY_MS);
+}
+
+// [settings, update, refresh]
+function useSharedSettings(): [Settings | undefined, (patch: Partial<Settings>) => void, () => void] {
+  const [settings, setLocalSettings] = useState<Settings | undefined>(sharedSettings);
+  useEffect(() => {
+    settingsListeners.add(setLocalSettings);
+    refreshSharedSettings();
+    return () => {
+      settingsListeners.delete(setLocalSettings);
+    };
+  }, []);
+  return [settings, updateSharedSettings, refreshSharedSettings];
 }
 
 // One kind of file (screenshots or recordings) with its own size limit,
@@ -1565,16 +1617,8 @@ function StorageBlock({
 }
 
 function StoragePanel() {
-  const [expanded, setExpanded] = useState(false);
-  const [settings, setLocalSettings] = useState<Settings | undefined>();
-
-  const refresh = useCallback(() => {
-    getSettings().then(setLocalSettings);
-  }, []);
-
-  useEffect(() => {
-    refresh();
-  }, [refresh]);
+  const [expanded, setExpanded] = useOpenPanel("storage");
+  const [settings, update, refresh] = useSharedSettings();
 
   // The toasts for these two events are shown by the plugin itself (see
   // definePlugin), since they happen while the menu is closed; the panel only
@@ -1587,8 +1631,6 @@ function StoragePanel() {
       removeEventListener("storage_threshold_reached", alerted);
     };
   }, [refresh]);
-
-  const update = useSettingsUpdater(settings, setLocalSettings);
 
   const limitShort = (mb: number) => storageLimitShort(mb / 1024);
   const summary = settings
@@ -1757,14 +1799,8 @@ const EXPORT_DISCORD_LIMIT_OPTIONS = [
 // as separate video and audio pieces; "Original" just joins them (instant,
 // big file), the other choices re-encode it to a smaller file.
 function VideoExportPanel() {
-  const [expanded, setExpanded] = useState(false);
-  const [settings, setLocalSettings] = useState<Settings | undefined>();
-
-  useEffect(() => {
-    getSettings().then(setLocalSettings);
-  }, []);
-
-  const update = useSettingsUpdater(settings, setLocalSettings);
+  const [expanded, setExpanded] = useOpenPanel("video-export");
+  const [settings, update] = useSharedSettings();
   const reencodes = settings?.export_quality !== "original";
 
   return (
@@ -1858,11 +1894,11 @@ function VideoExportPanel() {
 }
 
 function ShareOptionsPanel() {
-  const [expanded, setExpanded] = useState(false);
-  const [driveOpen, setDriveOpen] = useState(false);
-  const [discordOpen, setDiscordOpen] = useState(false);
-  const [steamOpen, setSteamOpen] = useState(false);
-  const [settings, setLocalSettings] = useState<Settings | undefined>();
+  const [expanded, setExpanded] = useOpenPanel("share-options");
+  const [driveOpen, setDriveOpen] = useOpenPanel("share-drive");
+  const [discordOpen, setDiscordOpen] = useOpenPanel("share-discord");
+  const [steamOpen, setSteamOpen] = useOpenPanel("share-steam");
+  const [settings, update, refreshSettings] = useSharedSettings();
   const [driveLinked, setDriveLinked] = useState<boolean | undefined>();
   const [driveConfigured, setDriveConfigured] = useState<boolean | undefined>();
   const [driveCredentialsSource, setDriveCredentialsSource] = useState<string | null | undefined>();
@@ -1891,12 +1927,9 @@ function ShareOptionsPanel() {
   }, []);
 
   useEffect(() => {
-    getSettings().then(setLocalSettings);
     refreshDriveStatus();
     refreshDiscordStatus();
   }, [refreshDriveStatus, refreshDiscordStatus]);
-
-  const update = useSettingsUpdater(settings, setLocalSettings);
 
   const onResetGoogleCredentials = async () => {
     const result = await clearGoogleCredentials();
@@ -1920,7 +1953,7 @@ function ShareOptionsPanel() {
       await unlinkGoogleDrive();
       toaster.toast({ title: "Google Drive unlinked", body: "Access has been revoked." });
       refreshDriveStatus();
-      getSettings().then(setLocalSettings); // the backend switches its auto-upload off
+      refreshSettings(); // the backend switches its auto-upload off
 
     } finally {
       setUnlinking(false);
@@ -1933,7 +1966,7 @@ function ShareOptionsPanel() {
       await unlinkDiscord();
       toaster.toast({ title: "Discord unlinked", body: "The webhook was deleted." });
       refreshDiscordStatus();
-      getSettings().then(setLocalSettings); // the backend switches its auto-upload off
+      refreshSettings(); // the backend switches its auto-upload off
     } finally {
       setUnlinkingDiscord(false);
     }
